@@ -1,0 +1,8 @@
+name = "ftth-pwa"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "ftth-db"
+database_id = "9664d61a-0431-488a-b3d6-b9cf5cb5fbdc"
