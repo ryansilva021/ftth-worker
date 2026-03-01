@@ -51,6 +51,13 @@ export default {
       if (pathname === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
       if (pathname === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
 
+      // ADMIN USERS (Bearer-admin only)
+      if (pathname === "/api/admin/users" && request.method === "GET") return corsResponse(request, await handleAdminListUsers(request, env));
+      if (pathname === "/api/admin/users" && request.method === "POST") return corsResponse(request, await handleAdminUpsertUser(request, env));
+      if (pathname === "/api/admin/users/reset_password" && request.method === "POST") return corsResponse(request, await handleAdminResetPassword(request, env));
+      if (pathname === "/api/admin/users/disable" && request.method === "POST") return corsResponse(request, await handleAdminDisableUser(request, env));
+
+
       // CTOs (D1)
       if (pathname === "/api/ctos") {
         if (!env.DB) return corsJson(request, { error: "DB_not_configured" }, 500);
@@ -153,6 +160,38 @@ async function requireAdminEither(request, env) {
   return { ok: false, status: 401, error: hasPw ? "not_admin" : "ADMIN_PASSWORD_not_configured_and_not_bearer_admin" };
 }
 
+// ---------------- Admin gating (Bearer-admin ONLY) for user management ----------------
+async function requireBearerAdmin(request, env) {
+  const auth = await requireAuth(request, env);
+  const row = await env.DB.prepare("SELECT role, is_active FROM users WHERE username=?1").bind(auth.user).first();
+  const role = String(row?.role || "user").trim().toLowerCase();
+  const active = Number(row?.is_active ?? 1) === 1;
+  if (!active) throw new Error("user_inactive");
+  if (role !== "admin") throw new Error("not_admin");
+  return auth;
+}
+function normalizeBool(v, def = 1) {
+  if (v === undefined || v === null || v === "") return def;
+  if (typeof v === "boolean") return v ? 1 : 0;
+  const s = String(v).trim().toLowerCase();
+  if (["1","true","sim","yes","y"].includes(s)) return 1;
+  if (["0","false","nao","não","no","n"].includes(s)) return 0;
+  return def;
+}
+function safeRole(v) {
+  const r = String(v || "user").trim().toLowerCase();
+  return r === "admin" ? "admin" : "user";
+}
+// Create password hash in the same format used by verifyPassword:
+// pbkdf2$<iters>$<salt_b64url>$<hash_b64url>
+async function makePasswordHash(password, iters = 120000) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const bits = await pbkdf2(password + (""), salt, iters, 32); // 32 bytes
+  const hash = new Uint8Array(bits);
+  return `pbkdf2$${iters}$${base64Url(salt)}$${base64Url(hash)}`;
+}
+
+
 // ---------------- AUTH (login/me/logout) ----------------
 function base64Url(bytes) {
   let bin = "";
@@ -221,6 +260,7 @@ async function handleLogin(request, env) {
 
   const token = await mintSession(env, user);
   const role = String(row.role || "user").trim() || "user";
+  try { await env.DB.prepare("UPDATE users SET last_login=?1 WHERE username=?2").bind(new Date().toISOString(), user).run(); } catch {}
   return new Response(JSON.stringify({ ok: true, token, user: { username: user, role } }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
@@ -315,6 +355,113 @@ async function handleDeleteCto(request, env) {
 
   await env.DB.prepare("DELETE FROM ctos WHERE CTO_ID=?1").bind(id).run();
   return new Response(JSON.stringify({ ok: true, deleted: id }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+
+
+// ---------------- ADMIN USERS (Bearer-admin only) ----------------
+async function handleAdminListUsers(request, env) {
+  await requireBearerAdmin(request, env);
+  const rs = await env.DB.prepare("SELECT username, role, is_active, created_at, updated_at, last_login FROM users ORDER BY username").all();
+  return new Response(JSON.stringify({ ok: true, users: rs.results || [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+async function handleAdminUpsertUser(request, env) {
+  await requireBearerAdmin(request, env);
+  const body = await readJson(request);
+  if (!body) return new Response(JSON.stringify({ error: "invalid_json" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const username = String(body.username || "").trim();
+  if (!username) return new Response(JSON.stringify({ error: "missing_username" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const role = safeRole(body.role);
+  const is_active = normalizeBool(body.is_active, 1);
+  const now = new Date().toISOString();
+
+  let password_hash = null;
+  if (body.password != null && String(body.password).trim() !== "") {
+    const iters = Number(body.iters || 120000);
+    password_hash = await makePasswordHash(String(body.password).trim(), iters);
+  }
+
+  const existing = await env.DB.prepare("SELECT username FROM users WHERE username=?1").bind(username).first();
+
+  if (!existing) {
+    if (!password_hash) return new Response(JSON.stringify({ error: "missing_password_for_new_user" }), { status: 400, headers: { "Content-Type": "application/json" } });
+    // Insert with timestamps if columns exist; if not, D1 will ignore unknown columns? It won't. So we keep minimal insert first then update timestamps best-effort.
+    await env.DB.prepare("INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
+      .bind(username, password_hash, role, is_active, now, now).run().catch(async () => {
+        // fallback if your users table lacks created_at/updated_at columns
+        await env.DB.prepare("INSERT INTO users (username, password_hash, role, is_active) VALUES (?1, ?2, ?3, ?4)")
+          .bind(username, password_hash, role, is_active).run();
+      });
+
+    return new Response(JSON.stringify({ ok: true, created: true, user: { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
+
+  if (password_hash) {
+    await env.DB.prepare("UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4 WHERE username=?5")
+      .bind(password_hash, role, is_active, now, username).run().catch(async () => {
+        await env.DB.prepare("UPDATE users SET password_hash=?1, role=?2, is_active=?3 WHERE username=?4")
+          .bind(password_hash, role, is_active, username).run();
+      });
+  } else {
+    await env.DB.prepare("UPDATE users SET role=?1, is_active=?2, updated_at=?3 WHERE username=?4")
+      .bind(role, is_active, now, username).run().catch(async () => {
+        await env.DB.prepare("UPDATE users SET role=?1, is_active=?2 WHERE username=?3")
+          .bind(role, is_active, username).run();
+      });
+  }
+
+  return new Response(JSON.stringify({ ok: true, updated: true, user: { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+async function handleAdminResetPassword(request, env) {
+  await requireBearerAdmin(request, env);
+  const body = await readJson(request);
+  if (!body) return new Response(JSON.stringify({ error: "invalid_json" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const username = String(body.username || "").trim();
+  const password = String(body.password || "").trim();
+  if (!username) return new Response(JSON.stringify({ error: "missing_username" }), { status: 400, headers: { "Content-Type": "application/json" } });
+  if (!password) return new Response(JSON.stringify({ error: "missing_password" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const iters = Number(body.iters || 120000);
+  const password_hash = await makePasswordHash(password, iters);
+  const now = new Date().toISOString();
+
+  await env.DB.prepare("UPDATE users SET password_hash=?1, updated_at=?2 WHERE username=?3")
+    .bind(password_hash, now, username).run().catch(async () => {
+      await env.DB.prepare("UPDATE users SET password_hash=?1 WHERE username=?2")
+        .bind(password_hash, username).run();
+    });
+
+  return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
+}
+
+async function handleAdminDisableUser(request, env) {
+  await requireBearerAdmin(request, env);
+  const body = await readJson(request);
+  if (!body) return new Response(JSON.stringify({ error: "invalid_json" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const username = String(body.username || "").trim();
+  if (!username) return new Response(JSON.stringify({ error: "missing_username" }), { status: 400, headers: { "Content-Type": "application/json" } });
+
+  const is_active = normalizeBool(body.is_active, 0);
+  const now = new Date().toISOString();
+
+  await env.DB.prepare("UPDATE users SET is_active=?1, updated_at=?2 WHERE username=?3")
+    .bind(is_active, now, username).run().catch(async () => {
+      await env.DB.prepare("UPDATE users SET is_active=?1 WHERE username=?2")
+        .bind(is_active, username).run();
+    });
+
+  // revoke sessions when disabling
+  if (is_active === 0) {
+    try { await env.DB.prepare("DELETE FROM sessions WHERE username=?1").bind(username).run(); } catch {}
+  }
+
+  return new Response(JSON.stringify({ ok: true, user: { username, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
 // ---------------- Optional /api/submit ----------------
