@@ -1,10 +1,24 @@
 /**
- * FTTH-PWA Worker - CTOs + CE/CDO + Rotas + Movimentações - 2026-03-01
+ * FTTH-PWA Worker - Full (Login + CTOs + CE/CDO + Rotas + Movimentações) - 2026-03-01
  *
- * Fix: Frontend calls /api/rotas_fibras and was receiving 404.
- * This worker implements Rotas Fibra endpoints backed by D1.
+ * Fixes:
+ * - Restores /api/login, /api/me, /api/logout (previous worker version removed them -> 404)
+ * - Provides /api/ctos, /api/caixas_emenda_cdo, /api/rotas_fibras, /api/movimentacoes
  *
- * D1 binding required: DB
+ * D1 tables used:
+ * - users (username, password_hash, role, is_active, last_login? optional)
+ * - sessions (token_hash, username, created_at, expires_at)
+ * - ctos
+ * - caixas_emenda_cdo          (matches your D1)
+ * - rotas_fibras
+ * - movimentacoes
+ *
+ * Auth model:
+ * - /api/login returns token
+ * - Client sends Authorization: Bearer <token>
+ *
+ * Notes:
+ * - This worker is tolerant to missing optional columns (e.g., last_login).
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -17,7 +31,7 @@ const ALLOWED_ORIGINS = new Set([
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
-    const pathname = url.pathname;
+    const p = url.pathname;
 
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -26,37 +40,44 @@ export default {
     try {
       if (!env.DB) return corsJson(request, { error: "DB_not_configured" }, 500);
 
-      // Ensure schema (safe even if ctx missing)
       const schemaPromise = ensureSchema(env);
       if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(schemaPromise.catch(() => {}));
       else await schemaPromise.catch(() => {});
 
-      // Health
-      if (request.method === "GET" && (pathname === "/" || pathname === "/api" || pathname === "/api/")) {
-        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-rotas" });
+      if (request.method === "GET" && (p === "/" || p === "/api" || p === "/api/")) {
+        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-full" });
       }
 
-      // CTOs
-      if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(env));
-      if (pathname === "/api/ctos" && request.method === "POST") return corsResponse(request, await handleUpsertCto(request, env));
-      if (pathname === "/api/ctos" && request.method === "DELETE") return corsResponse(request, await handleDeleteCto(request, env));
+      // AUTH
+      if (p === "/api/login" && request.method === "POST") return corsResponse(request, await handleLogin(request, env));
+      if (p === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
+      if (p === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
 
-      // CE/CDO
-      if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCeCdo(env));
-      if (pathname === "/api/caixas_emenda_cdo" && request.method === "POST") return corsResponse(request, await handleUpsertCeCdo(request, env));
-      if (pathname === "/api/caixas_emenda_cdo" && request.method === "DELETE") return corsResponse(request, await handleDeleteCeCdo(request, env));
+      // CTOs
+      if (p === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(env));
+      if (p === "/api/ctos" && request.method === "POST") return corsResponse(request, await handleUpsertCto(request, env));
+      if (p === "/api/ctos" && request.method === "DELETE") return corsResponse(request, await handleDeleteCto(request, env));
+
+      // CE/CDO (endpoint name fixed, table name matches your D1)
+      if (p === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCeCdo(env));
+      if (p === "/api/caixas_emenda_cdo" && request.method === "POST") return corsResponse(request, await handleUpsertCeCdo(request, env));
+      if (p === "/api/caixas_emenda_cdo" && request.method === "DELETE") return corsResponse(request, await handleDeleteCeCdo(request, env));
 
       // Rotas fibras
-      if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(env));
-      if (pathname === "/api/rotas_fibras" && request.method === "POST") return corsResponse(request, await handleUpsertRota(request, env));
-      if (pathname === "/api/rotas_fibras" && request.method === "DELETE") return corsResponse(request, await handleDeleteRota(request, env));
+      if (p === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(env));
+      if (p === "/api/rotas_fibras" && request.method === "POST") return corsResponse(request, await handleUpsertRota(request, env));
+      if (p === "/api/rotas_fibras" && request.method === "DELETE") return corsResponse(request, await handleDeleteRota(request, env));
 
       // Movimentações
-      if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(env, url));
+      if (p === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(env, url));
 
       return corsJson(request, { error: "not_found" }, 404);
     } catch (err) {
-      return corsJson(request, { error: "server_error", message: String(err?.message || err), stack: String(err?.stack || "") }, 500);
+      return corsJson(
+        request,
+        { error: "server_error", message: String(err?.message || err), stack: String(err?.stack || "") },
+        500
+      );
     }
   },
 };
@@ -78,10 +99,10 @@ function corsResponse(request, response) {
   for (const [k, v] of Object.entries(ch)) headers.set(k, v);
   return new Response(response.body, { status: response.status, headers });
 }
-function jsonResponse(obj, status=200) {
+function jsonResponse(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json; charset=utf-8" } });
 }
-function corsJson(request, obj, status=200) {
+function corsJson(request, obj, status = 200) {
   return corsResponse(request, jsonResponse(obj, status));
 }
 async function readJson(request) {
@@ -89,7 +110,21 @@ async function readJson(request) {
 }
 
 // ---------------- Schema ----------------
-async function ensureSchema(env){
+async function ensureSchema(env) {
+  await env.DB.exec(`CREATE TABLE IF NOT EXISTS users (
+    username TEXT PRIMARY KEY,
+    password_hash TEXT NOT NULL,
+    role TEXT DEFAULT 'user',
+    is_active INTEGER DEFAULT 1
+  );`);
+  await env.DB.exec(`CREATE TABLE IF NOT EXISTS sessions (
+    token_hash TEXT PRIMARY KEY,
+    username TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now')),
+    expires_at TEXT
+  );`);
+  await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions(username);`);
+
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS ctos (
     cto_id TEXT PRIMARY KEY,
     nome TEXT,
@@ -101,7 +136,7 @@ async function ensureSchema(env){
   );`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_ctos_lat_lng ON ctos(lat, lng);`);
 
-  // table already created in D1: caixas_emenda_cdo
+  // ✅ Matches your D1 table
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (
     id TEXT PRIMARY KEY,
     nome TEXT,
@@ -131,18 +166,155 @@ async function ensureSchema(env){
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_mov_cto_ts ON movimentacoes(cto_id, ts);`);
 }
 
-// ---------------- CTOs ----------------
-function normId(v){ return String(v||"").trim(); }
-function normNum(v){ const n = Number(v); return Number.isFinite(n) ? n : null; }
-function normInt(v){ const n = parseInt(String(v),10); return Number.isFinite(n) ? n : 0; }
-
-async function handleGetCtos(env){
-  const rs = await env.DB.prepare("SELECT cto_id, nome, rua, bairro, lat, lng, capacidade FROM ctos").all();
-  return jsonResponse({ ok:true, ctos: rs.results || [] }, 200);
+// ---------------- Auth primitives ----------------
+function getBearer(request) {
+  const h = request.headers.get("authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1].trim() : null;
 }
-async function handleUpsertCto(request, env){
+async function sha256Hex(str) {
+  const enc = new TextEncoder().encode(str);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+function base64Url(bytes) {
+  let bin = "";
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+function fromB64Url(s) {
+  try {
+    s = s.replace(/-/g, "+").replace(/_/g, "/");
+    while (s.length % 4) s += "=";
+    const bin = atob(s);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a[i] ^ b[i];
+  return r === 0;
+}
+async function pbkdf2(password, saltBytes, iters, keyLen) {
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw",
+    new TextEncoder().encode(password),
+    { name: "PBKDF2" },
+    false,
+    ["deriveBits"]
+  );
+  return await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt: saltBytes, iterations: iters },
+    keyMaterial,
+    keyLen * 8
+  );
+}
+async function verifyPassword(password, stored, pepper = "") {
+  const parts = String(stored || "").split("$");
+  if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
+  const iters = Number(parts[1] || 0);
+  const salt = fromB64Url(parts[2]);
+  const hash = fromB64Url(parts[3]);
+  if (!iters || !salt || !hash) return false;
+  const derivedBits = await pbkdf2(password + pepper, salt, iters, hash.byteLength);
+  return timingSafeEqual(new Uint8Array(derivedBits), new Uint8Array(hash));
+}
+
+async function mintSession(env, username) {
+  const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
+  const token = base64Url(tokenBytes);
+  const tokenHash = await sha256Hex(token);
+  const ttl = Number(env.SESSION_TTL_MS || 1000 * 60 * 60 * 24 * 7);
+  const expires = new Date(Date.now() + ttl).toISOString();
+  await env.DB.prepare(
+    "INSERT INTO sessions (token_hash, username, created_at, expires_at) VALUES (?1, ?2, ?3, ?4)"
+  )
+    .bind(tokenHash, username, new Date().toISOString(), expires)
+    .run();
+  return token;
+}
+async function requireAuth(request, env) {
+  const token = getBearer(request);
+  if (!token) throw new Error("missing_authorization");
+  const tokenHash = await sha256Hex(token);
+  const row = await env.DB.prepare("SELECT username, expires_at FROM sessions WHERE token_hash=?1")
+    .bind(tokenHash)
+    .first();
+  if (!row) throw new Error("invalid_token");
+  const exp = row.expires_at ? Date.parse(row.expires_at) : NaN;
+  if (Number.isFinite(exp) && exp < Date.now()) {
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
+    throw new Error("token_expired");
+  }
+  return { username: row.username, tokenHash };
+}
+
+// ---------------- AUTH endpoints ----------------
+async function handleLogin(request, env) {
+  const origin = request.headers.get("origin") || "";
+  if (origin && !ALLOWED_ORIGINS.has(origin)) return jsonResponse({ error: "origin_not_allowed", origin }, 403);
+
   const body = await readJson(request);
-  if (!body) return jsonResponse({ error:"invalid_json" }, 400);
+  if (!body) return jsonResponse({ error: "invalid_json" }, 400);
+
+  const user = String(body.user || "").trim();
+  const password = String(body.password || "").trim();
+  if (!user || !password) return jsonResponse({ error: "missing_user_password" }, 400);
+
+  const row = await env.DB.prepare("SELECT username, password_hash, role, is_active FROM users WHERE username=?1")
+    .bind(user)
+    .first();
+  if (!row || Number(row.is_active ?? 1) !== 1) return jsonResponse({ error: "invalid_credentials" }, 401);
+
+  const ok = await verifyPassword(password, row.password_hash, env.PASSWORD_PEPPER || "");
+  if (!ok) return jsonResponse({ error: "invalid_credentials" }, 401);
+
+  const token = await mintSession(env, user);
+
+  // best-effort last_login (optional column)
+  try {
+    await env.DB.prepare("UPDATE users SET last_login=?1 WHERE username=?2").bind(new Date().toISOString(), user).run();
+  } catch {}
+
+  return jsonResponse({ ok: true, token, user: { username: user, role: String(row.role || "user") } }, 200);
+}
+async function handleMe(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    const row = await env.DB.prepare("SELECT role, is_active FROM users WHERE username=?1").bind(auth.username).first();
+    if (!row || Number(row.is_active ?? 1) !== 1) return jsonResponse({ error: "user_inactive" }, 401);
+    return jsonResponse({ ok: true, user: { username: auth.username, role: String(row.role || "user") } }, 200);
+  } catch (e) {
+    return jsonResponse({ error: String(e?.message || "unauthorized") }, 401);
+  }
+}
+async function handleLogout(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(auth.tokenHash).run();
+  } catch {}
+  return jsonResponse({ ok: true }, 200);
+}
+
+// ---------------- DTO helpers ----------------
+function normId(v) { return String(v || "").trim(); }
+function normNum(v) { const n = Number(v); return Number.isFinite(n) ? n : null; }
+function normInt(v) { const n = parseInt(String(v), 10); return Number.isFinite(n) ? n : 0; }
+function safeJsonParse(s){ try{ return JSON.parse(s); }catch{ return null; } }
+
+// ---------------- CTOs ----------------
+async function handleGetCtos(env) {
+  const rs = await env.DB.prepare("SELECT cto_id, nome, rua, bairro, lat, lng, capacidade FROM ctos").all();
+  return jsonResponse({ ok: true, ctos: rs.results || [] }, 200);
+}
+async function handleUpsertCto(request, env) {
+  const body = await readJson(request);
+  if (!body) return jsonResponse({ error: "invalid_json" }, 400);
 
   const cto_id = normId(body.cto_id || body.CTO_ID || body.id);
   const nome = String(body.nome ?? body.NOME ?? cto_id);
@@ -151,32 +323,33 @@ async function handleUpsertCto(request, env){
   const lat = normNum(body.lat ?? body.LAT);
   const lng = normNum(body.lng ?? body.LNG);
   const capacidade = normInt(body.capacidade ?? body.CAPACIDADE ?? 0);
-  if (!cto_id || lat==null || lng==null) return jsonResponse({ error:"missing_fields" }, 400);
+  if (!cto_id || lat == null || lng == null) return jsonResponse({ error: "missing_fields" }, 400);
 
   await env.DB.prepare(`INSERT INTO ctos (cto_id, nome, rua, bairro, lat, lng, capacidade)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     ON CONFLICT(cto_id) DO UPDATE SET
       nome=excluded.nome, rua=excluded.rua, bairro=excluded.bairro,
-      lat=excluded.lat, lng=excluded.lng, capacidade=excluded.capacidade
-  `).bind(cto_id, nome, rua, bairro, lat, lng, capacidade).run();
+      lat=excluded.lat, lng=excluded.lng, capacidade=excluded.capacidade`)
+    .bind(cto_id, nome, rua, bairro, lat, lng, capacidade)
+    .run();
 
-  return jsonResponse({ ok:true, cto: { cto_id, nome, rua, bairro, lat, lng, capacidade } }, 200);
+  return jsonResponse({ ok: true, cto: { cto_id, nome, rua, bairro, lat, lng, capacidade } }, 200);
 }
-async function handleDeleteCto(request, env){
+async function handleDeleteCto(request, env) {
   const id = normId(new URL(request.url).searchParams.get("id") || "");
-  if (!id) return jsonResponse({ error:"missing_id" }, 400);
+  if (!id) return jsonResponse({ error: "missing_id" }, 400);
   await env.DB.prepare("DELETE FROM ctos WHERE cto_id=?1").bind(id).run();
-  return jsonResponse({ ok:true }, 200);
+  return jsonResponse({ ok: true }, 200);
 }
 
 // ---------------- CE/CDO ----------------
-async function handleGetCeCdo(env){
+async function handleGetCeCdo(env) {
   const rs = await env.DB.prepare("SELECT id, nome, rua, bairro, lat, lng, tipo FROM caixas_emenda_cdo").all();
-  return jsonResponse({ ok:true, items: rs.results || [] }, 200);
+  return jsonResponse({ ok: true, items: rs.results || [] }, 200);
 }
-async function handleUpsertCeCdo(request, env){
+async function handleUpsertCeCdo(request, env) {
   const body = await readJson(request);
-  if (!body) return jsonResponse({ error:"invalid_json" }, 400);
+  if (!body) return jsonResponse({ error: "invalid_json" }, 400);
 
   const id = normId(body.id || body.ID || body.ce_id || body.cdo_id);
   const nome = String(body.nome ?? body.NOME ?? id);
@@ -185,82 +358,86 @@ async function handleUpsertCeCdo(request, env){
   const lat = normNum(body.lat ?? body.LAT);
   const lng = normNum(body.lng ?? body.LNG);
   const tipoRaw = String(body.tipo ?? body.TIPO ?? "CDO").toUpperCase();
-  const tipo = (tipoRaw === "CE") ? "CE" : "CDO";
-  if (!id || lat==null || lng==null) return jsonResponse({ error:"missing_fields" }, 400);
+  const tipo = tipoRaw === "CE" ? "CE" : "CDO";
+  if (!id || lat == null || lng == null) return jsonResponse({ error: "missing_fields" }, 400);
 
   await env.DB.prepare(`INSERT INTO caixas_emenda_cdo (id, nome, rua, bairro, lat, lng, tipo)
     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
     ON CONFLICT(id) DO UPDATE SET
       nome=excluded.nome, rua=excluded.rua, bairro=excluded.bairro,
-      lat=excluded.lat, lng=excluded.lng, tipo=excluded.tipo
-  `).bind(id, nome, rua, bairro, lat, lng, tipo).run();
+      lat=excluded.lat, lng=excluded.lng, tipo=excluded.tipo`)
+    .bind(id, nome, rua, bairro, lat, lng, tipo)
+    .run();
 
-  return jsonResponse({ ok:true, item: { id, nome, rua, bairro, lat, lng, tipo } }, 200);
+  return jsonResponse({ ok: true, item: { id, nome, rua, bairro, lat, lng, tipo } }, 200);
 }
-async function handleDeleteCeCdo(request, env){
+async function handleDeleteCeCdo(request, env) {
   const id = normId(new URL(request.url).searchParams.get("id") || "");
-  if (!id) return jsonResponse({ error:"missing_id" }, 400);
+  if (!id) return jsonResponse({ error: "missing_id" }, 400);
   await env.DB.prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1").bind(id).run();
-  return jsonResponse({ ok:true }, 200);
+  return jsonResponse({ ok: true }, 200);
 }
 
-// ---------------- Rotas ----------------
-function toFeatureCollection(features){ return { type:"FeatureCollection", features: features || [] }; }
-function safeJsonParse(s){ try{ return JSON.parse(s); }catch{ return null; } }
-
-async function handleGetRotas(env){
+// ---------------- Rotas fibras ----------------
+async function handleGetRotas(env) {
   const rs = await env.DB.prepare("SELECT id, nome, geojson FROM rotas_fibras").all();
   const features = [];
-  for (const r of (rs.results || [])){
+  for (const r of (rs.results || [])) {
     const gj = safeJsonParse(r.geojson);
     if (gj && gj.type === "Feature") features.push(gj);
+    else if (gj && gj.type === "FeatureCollection" && Array.isArray(gj.features)) {
+      for (const f of gj.features) if (f && f.type === "Feature") features.push(f);
+    }
   }
-  const fc = toFeatureCollection(features);
-  return jsonResponse({ ok:true, geojson: fc, features: fc.features }, 200);
+  const fc = { type: "FeatureCollection", features };
+  return jsonResponse({ ok: true, geojson: fc, features }, 200);
 }
-async function handleUpsertRota(request, env){
+async function handleUpsertRota(request, env) {
   const body = await readJson(request);
-  if (!body) return jsonResponse({ error:"invalid_json" }, 400);
+  if (!body) return jsonResponse({ error: "invalid_json" }, 400);
 
   const id = normId(body.id || body.ID || body.rota_id || body.ROTA_ID || body.nome);
   const nome = String(body.nome ?? body.NOME ?? id);
-  let feature = body.geojson || body.feature;
+
+  let feature = body.feature || body.geojson || body.GEOJSON;
   if (typeof feature === "string") feature = safeJsonParse(feature);
 
-  if (feature && feature.type === "FeatureCollection" && Array.isArray(feature.features) && feature.features.length){
+  if (feature && feature.type === "FeatureCollection" && Array.isArray(feature.features) && feature.features.length) {
     feature = feature.features[0];
   }
-  if (feature && feature.type === "LineString"){
-    feature = { type:"Feature", geometry: feature, properties:{ id, nome } };
+  if (feature && feature.type === "LineString") {
+    feature = { type: "Feature", geometry: feature, properties: { id, nome } };
   }
-  if (!id || !feature || feature.type !== "Feature" || !feature.geometry || feature.geometry.type !== "LineString"){
-    return jsonResponse({ error:"missing_fields", message:"id + geojson Feature(LineString) required" }, 400);
+
+  if (!id || !feature || feature.type !== "Feature" || !feature.geometry || feature.geometry.type !== "LineString") {
+    return jsonResponse({ error: "missing_fields", message: "id + Feature(LineString) required" }, 400);
   }
-  feature.properties = { ...(feature.properties||{}), id, nome };
+
+  feature.properties = { ...(feature.properties || {}), id, nome };
 
   await env.DB.prepare(`INSERT INTO rotas_fibras (id, nome, geojson)
     VALUES (?1, ?2, ?3)
     ON CONFLICT(id) DO UPDATE SET
-      nome=excluded.nome, geojson=excluded.geojson
-  `).bind(id, nome, JSON.stringify(feature)).run();
+      nome=excluded.nome, geojson=excluded.geojson`)
+    .bind(id, nome, JSON.stringify(feature))
+    .run();
 
-  return jsonResponse({ ok:true, rota:{ id, nome }, feature }, 200);
+  return jsonResponse({ ok: true, rota: { id, nome }, feature }, 200);
 }
-async function handleDeleteRota(request, env){
+async function handleDeleteRota(request, env) {
   const id = normId(new URL(request.url).searchParams.get("id") || "");
-  if (!id) return jsonResponse({ error:"missing_id" }, 400);
+  if (!id) return jsonResponse({ error: "missing_id" }, 400);
   await env.DB.prepare("DELETE FROM rotas_fibras WHERE id=?1").bind(id).run();
-  return jsonResponse({ ok:true }, 200);
+  return jsonResponse({ ok: true }, 200);
 }
 
 // ---------------- Movimentações ----------------
-async function handleGetMovimentacoes(env, url){
-  const limit = Math.min(500, Math.max(0, parseInt(url.searchParams.get("limit")||"300",10) || 300));
-  try{
-    const rs = await env.DB.prepare("SELECT id, cto_id, tipo, cliente, usuario, obs, ts FROM movimentacoes ORDER BY ts DESC LIMIT ?1")
-      .bind(limit).all();
-    return jsonResponse({ ok:true, items: rs.results || [] }, 200);
-  }catch(e){
-    return jsonResponse({ ok:true, items: [], note: "no_table_or_query_error", message:String(e?.message||e) }, 200);
-  }
+async function handleGetMovimentacoes(env, url) {
+  const limit = Math.min(500, Math.max(0, parseInt(url.searchParams.get("limit") || "300", 10) || 300));
+  const rs = await env.DB
+    .prepare("SELECT id, cto_id, tipo, cliente, usuario, obs, ts FROM movimentacoes ORDER BY ts DESC LIMIT ?1")
+    .bind(limit)
+    .all()
+    .catch(() => ({ results: [] }));
+  return jsonResponse({ ok: true, items: rs.results || [] }, 200);
 }
