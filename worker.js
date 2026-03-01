@@ -406,37 +406,54 @@ async function handleAdminUpsertUser(request, env) {
     password_hash = await makePasswordHash(String(body.password).trim(), iters);
   }
 
-  const existing = await env.DB.prepare("SELECT username FROM users WHERE username=?1").bind(username).first();
+  try {
+    const existing = await env.DB.prepare("SELECT username FROM users WHERE username=?1").bind(username).first();
 
-  if (!existing) {
-    if (!password_hash) return new Response(JSON.stringify({ error: "missing_password_for_new_user" }), { status: 400, headers: { "Content-Type": "application/json" } });
-    // Insert with timestamps if columns exist; if not, D1 will ignore unknown columns? It won't. So we keep minimal insert first then update timestamps best-effort.
-    await env.DB.prepare("INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)")
-      .bind(username, password_hash, role, is_active, now, now).run().catch(async () => {
-        // fallback if your users table lacks created_at/updated_at columns
-        await env.DB.prepare("INSERT INTO users (username, password_hash, role, is_active) VALUES (?1, ?2, ?3, ?4)")
-          .bind(username, password_hash, role, is_active).run();
+    if (!existing) {
+      if (!password_hash) {
+        return new Response(JSON.stringify({ error: "missing_password_for_new_user" }), { status: 400, headers: { "Content-Type": "application/json" } });
+      }
+
+      // Insert (with or without timestamp columns)
+      await env.DB.prepare(
+        "INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)"
+      ).bind(username, password_hash, role, is_active, now, now).run().catch(async () => {
+        await env.DB.prepare(
+          "INSERT INTO users (username, password_hash, role, is_active) VALUES (?1, ?2, ?3, ?4)"
+        ).bind(username, password_hash, role, is_active).run();
       });
 
-    return new Response(JSON.stringify({ ok: true, created: true, user: { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
+      // Verify
+      const row = await env.DB.prepare("SELECT username, role, is_active FROM users WHERE username=?1").bind(username).first();
+      return new Response(JSON.stringify({ ok: true, created: true, user: row || { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+
+    // Update
+    if (password_hash) {
+      await env.DB.prepare(
+        "UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4 WHERE username=?5"
+      ).bind(password_hash, role, is_active, now, username).run().catch(async () => {
+        await env.DB.prepare(
+          "UPDATE users SET password_hash=?1, role=?2, is_active=?3 WHERE username=?4"
+        ).bind(password_hash, role, is_active, username).run();
+      });
+    } else {
+      await env.DB.prepare(
+        "UPDATE users SET role=?1, is_active=?2, updated_at=?3 WHERE username=?4"
+      ).bind(role, is_active, now, username).run().catch(async () => {
+        await env.DB.prepare(
+          "UPDATE users SET role=?1, is_active=?2 WHERE username=?3"
+        ).bind(role, is_active, username).run();
+      });
+    }
+
+    const row = await env.DB.prepare("SELECT username, role, is_active FROM users WHERE username=?1").bind(username).first();
+    return new Response(JSON.stringify({ ok: true, updated: true, user: row || { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: "upsert_failed", message: String(e?.message || e) }), { status: 500, headers: { "Content-Type": "application/json" } });
   }
-
-  if (password_hash) {
-    await env.DB.prepare("UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4 WHERE username=?5")
-      .bind(password_hash, role, is_active, now, username).run().catch(async () => {
-        await env.DB.prepare("UPDATE users SET password_hash=?1, role=?2, is_active=?3 WHERE username=?4")
-          .bind(password_hash, role, is_active, username).run();
-      });
-  } else {
-    await env.DB.prepare("UPDATE users SET role=?1, is_active=?2, updated_at=?3 WHERE username=?4")
-      .bind(role, is_active, now, username).run().catch(async () => {
-        await env.DB.prepare("UPDATE users SET role=?1, is_active=?2 WHERE username=?3")
-          .bind(role, is_active, username).run();
-      });
-  }
-
-  return new Response(JSON.stringify({ ok: true, updated: true, user: { username, role, is_active } }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
+
 
 async function handleAdminResetPassword(request, env) {
   await requireBearerAdmin(request, env);
