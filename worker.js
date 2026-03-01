@@ -1,15 +1,16 @@
 /**
- * FTTH-PWA Worker (CTOs + CE/CDO + Movimentações) - 2026-03-01
+ * FTTH-PWA Worker - aligned CE/CDO table name - 2026-03-01
  *
- * Fix: Frontend calls GET /api/movimentacoes and was receiving 404.
- * This worker now serves /api/movimentacoes (returns recent movements if table exists; otherwise empty list).
+ * Endpoint used by frontend: /api/caixas_emenda_cdo
+ * ✅ D1 table name (as created): caixas_emenda_cdo
  *
- * Keeps:
- *  - /api/login, /api/me, /api/logout
+ * Includes:
  *  - /api/ctos (GET/POST/DELETE)
  *  - /api/caixas_emenda_cdo (GET/POST/DELETE)
+ *  - /api/movimentacoes (GET) (empty if none)
+ *  - /api/login, /api/me, /api/logout (session-based)
  *
- * D1 binding: DB
+ * D1 binding required: DB
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -24,16 +25,20 @@ export default {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
-    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
+    }
 
     try {
       if (!env.DB) return corsJson(request, { error: "DB_not_configured" }, 500);
 
-      // best-effort schema ensure
-      ctx.waitUntil(ensureSchema(env).catch(()=>{}));
+      // Ensure schema (safe even if ctx missing)
+      const schemaPromise = ensureSchema(env);
+      if (ctx && typeof ctx.waitUntil === "function") ctx.waitUntil(schemaPromise.catch(() => {}));
+      else await schemaPromise.catch(() => {});
 
       if (request.method === "GET" && (pathname === "/" || pathname === "/api" || pathname === "/api/")) {
-        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-ctos-cecdo-mov" });
+        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-aligned-cecdo" });
       }
 
       // AUTH
@@ -41,16 +46,17 @@ export default {
       if (pathname === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
       if (pathname === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
 
-      // DATA
+      // CTOs
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/ctos" && request.method === "POST") return corsResponse(request, await handleUpsertCto(request, env));
       if (pathname === "/api/ctos" && request.method === "DELETE") return corsResponse(request, await handleDeleteCto(request, env));
 
+      // CE/CDO
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCeCdo(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "POST") return corsResponse(request, await handleUpsertCeCdo(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "DELETE") return corsResponse(request, await handleDeleteCeCdo(request, env));
 
-      // Movimentações (GET)
+      // Movimentações
       if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env, url));
 
       return corsJson(request, { error: "not_found" }, 404);
@@ -100,6 +106,7 @@ async function ensureSchema(env){
   );`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_ctos_lat_lng ON ctos(lat, lng);`);
 
+  // ✅ table name matches your D1: caixas_emenda_cdo
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (
     id TEXT PRIMARY KEY,
     nome TEXT,
@@ -111,7 +118,6 @@ async function ensureSchema(env){
   );`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_cecdo_lat_lng ON caixas_emenda_cdo(lat, lng);`);
 
-  // Movimentações: simples (para evitar 404 agora). Você pode evoluir depois.
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS movimentacoes (
     id TEXT PRIMARY KEY,
     cto_id TEXT,
@@ -184,7 +190,6 @@ async function verifyPassword(password, stored, pepper="") {
   const derivedBits = await pbkdf2(password + pepper, salt, iters, hash.byteLength);
   return timingSafeEqual(new Uint8Array(derivedBits), new Uint8Array(hash));
 }
-
 async function requireAuth(request, env){
   const token = getBearer(request);
   if (!token) throw new Error("missing_authorization");
@@ -198,7 +203,6 @@ async function requireAuth(request, env){
   }
   return { username: row.username, tokenHash };
 }
-
 async function mintSession(env, username){
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
   const token = base64Url(tokenBytes);
@@ -259,8 +263,6 @@ async function handleGetCtos(_req, env){
   return jsonResponse({ ok:true, ctos: rs.results || [] }, 200);
 }
 async function handleUpsertCto(request, env){
-  // keep admin check outside for now if you want; for continuity, allow any authenticated user to upsert? no.
-  // We'll keep as-is: require auth then role=admin is handled elsewhere in your full worker.
   const body = await readJson(request);
   if (!body) return jsonResponse({ error:"invalid_json" }, 400);
 
@@ -291,8 +293,12 @@ async function handleDeleteCto(request, env){
 
 // ---------------- CE/CDO ----------------
 async function handleGetCeCdo(_req, env){
-  const rs = await env.DB.prepare("SELECT id, nome, rua, bairro, lat, lng, tipo FROM caixas_emenda_cdo").all();
-  return jsonResponse({ ok:true, items: rs.results || [] }, 200);
+  try{
+    const rs = await env.DB.prepare("SELECT id, nome, rua, bairro, lat, lng, tipo FROM caixas_emenda_cdo").all();
+    return jsonResponse({ ok:true, items: rs.results || [] }, 200);
+  }catch(e){
+    return jsonResponse({ ok:true, items: [], note:"query_error", message:String(e?.message||e) }, 200);
+  }
 }
 async function handleUpsertCeCdo(request, env){
   const body = await readJson(request);
@@ -324,16 +330,14 @@ async function handleDeleteCeCdo(request, env){
   return jsonResponse({ ok:true }, 200);
 }
 
-// ---------------- Movimentações (GET) ----------------
+// ---------------- Movimentações ----------------
 async function handleGetMovimentacoes(_req, env, url){
-  // optional limit param
   const limit = Math.min(500, Math.max(0, parseInt(url.searchParams.get("limit")||"300",10) || 300));
   try{
     const rs = await env.DB.prepare("SELECT id, cto_id, tipo, cliente, usuario, obs, ts FROM movimentacoes ORDER BY ts DESC LIMIT ?1")
       .bind(limit).all();
     return jsonResponse({ ok:true, items: rs.results || [] }, 200);
   }catch(e){
-    // If table missing for some reason, return empty instead of 404/500
-    return jsonResponse({ ok:true, items: [], note: "no_table" }, 200);
+    return jsonResponse({ ok:true, items: [], note: "no_table_or_query_error", message:String(e?.message||e) }, 200);
   }
 }
