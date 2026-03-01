@@ -1,18 +1,26 @@
 /**
- * FTTH-PWA Worker - FULL (D1 + Roles + CTO CRUD + CSV endpoints) - 2026-03-01
+ * FTTH-PWA Worker - FINAL (D1 + Roles + Bearer-admin + CSV fallbacks) - 2026-03-01
  *
- * Fixes:
- * - Login returns ROLE (admin shows as admin, not user)
- * - Restores /api/movimentacoes, /api/rotas_fibras, /api/caixas_emenda_cdo, /api/log_eventos, /api/usuarios
- * - CORS allows Authorization + X-Admin-Password
+ * What this fixes in your current errors:
+ * - Your UI is sending Authorization (Bearer token) and sometimes NOT sending X-Admin-Password.
+ *   Previously, writes failed with ADMIN_PASSWORD_not_configured.
+ *   NOW: write access is granted if EITHER:
+ *     (A) X-Admin-Password matches ADMIN_PASSWORD, OR
+ *     (B) Authorization: Bearer <token> belongs to a user with role='admin' in D1.
+ *
+ * - CSV endpoints (/api/movimentacoes, /api/rotas_fibras, /api/caixas_emenda_cdo, /api/log_eventos, /api/usuarios)
+ *   will NEVER throw; if CSV URL missing or fetch fails => returns empty array/FeatureCollection with 200.
+ *
+ * - CORS preflight allows Authorization + X-Admin-Password.
  *
  * REQUIRED:
  * - D1 binding: DB  (ftth-db)
- * - D1 tables: users, sessions, ctos
- * - Secret: ADMIN_PASSWORD (for writes)
+ * - D1 tables: users(username, password_hash, role, is_active), sessions(token_hash, username, created_at, expires_at), ctos(...)
  *
- * OPTIONAL (CSV reads): SHEETS_*_CSV_URL variables (if missing -> returns [] / empty FC)
- * OPTIONAL (/api/submit): APPS_SCRIPT_URL, SUBMIT_KEY
+ * OPTIONAL:
+ * - ADMIN_PASSWORD (secret)  -> if you want password-based admin too
+ * - SHEETS_*_CSV_URL         -> for the CSV read endpoints; missing is fine
+ * - APPS_SCRIPT_URL / SUBMIT_KEY -> for /api/submit
  */
 
 const ALLOWED_ORIGINS = new Set([
@@ -27,13 +35,15 @@ export default {
     const url = new URL(request.url);
     const { pathname } = url;
 
+    // Preflight
     if (request.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(request, { restricted: true }) });
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
 
     try {
+      // Health
       if (request.method === "GET" && (pathname === "/" || pathname === "/api" || pathname === "/api/")) {
-        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-full-d1-role-csv" });
+        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-final" });
       }
 
       // AUTH
@@ -44,9 +54,11 @@ export default {
       // CTOs (D1)
       if (pathname === "/api/ctos") {
         if (!env.DB) return corsJson(request, { error: "DB_not_configured" }, 500);
+
         if (request.method === "GET") return corsResponse(request, await handleGetCtos(env));
         if (request.method === "POST") return corsResponse(request, await handleUpsertCto(request, env));
         if (request.method === "DELETE") return corsResponse(request, await handleDeleteCto(request, env));
+
         return corsJson(request, { error: "method_not_allowed" }, 405);
       }
 
@@ -57,7 +69,7 @@ export default {
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsJson(request, await getLogEventos(env, url), 200, { cacheSeconds: 15 });
       if (pathname === "/api/usuarios" && request.method === "GET") return corsJson(request, await getUsuarios(env), 200, { cacheSeconds: 30 });
 
-      // Optional /api/submit
+      // Optional /api/submit (keeps compatibility)
       if (pathname === "/api/submit" && request.method === "POST") return corsResponse(request, await handleSubmit(request, env));
 
       return corsJson(request, { error: "not_found" }, 404);
@@ -68,43 +80,30 @@ export default {
 };
 
 // ---------------- CORS ----------------
-function corsHeaders(request, { restricted } = { restricted: true }) {
+function corsHeaders(request) {
   const origin = request.headers.get("origin") || "";
-  const allowOrigin = restricted ? (ALLOWED_ORIGINS.has(origin) ? origin : "") : "*";
-
-  const h = {
+  const allowOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "*";
+  return {
+    "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
     "Access-Control-Allow-Headers": "Content-Type, Authorization, X-Admin-Password",
     "Vary": "Origin",
   };
-  if (allowOrigin) h["Access-Control-Allow-Origin"] = allowOrigin;
-  else if (!restricted) h["Access-Control-Allow-Origin"] = "*";
-  return h;
 }
 function corsResponse(request, response) {
   const headers = new Headers(response.headers);
-  const ch = corsHeaders(request, { restricted: true });
+  const ch = corsHeaders(request);
   for (const [k, v] of Object.entries(ch)) headers.set(k, v);
   return new Response(response.body, { status: response.status, headers });
 }
 function corsJson(request, obj, status = 200, { cacheSeconds } = {}) {
-  const headers = {};
+  const headers = { "Content-Type": "application/json; charset=utf-8" };
   if (cacheSeconds != null) headers["Cache-Control"] = `public, max-age=${cacheSeconds}`;
-  return corsResponse(request, new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json; charset=utf-8", ...headers } }));
+  return corsResponse(request, new Response(JSON.stringify(obj), { status, headers }));
 }
 async function readJson(request) { return await request.json().catch(() => null); }
 
-// ---------------- Admin ----------------
-function requireAdmin(request, env) {
-  const expected = String(env.ADMIN_PASSWORD || "").trim();
-  if (!expected) return { ok: false, status: 500, error: "ADMIN_PASSWORD_not_configured" };
-  const got = String(request.headers.get("x-admin-password") || request.headers.get("X-Admin-Password") || "").trim();
-  if (!got) return { ok: false, status: 401, error: "missing_admin_password" };
-  if (got !== expected) return { ok: false, status: 401, error: "invalid_admin_password" };
-  return { ok: true };
-}
-
-// ---------------- Auth helpers ----------------
+// ---------------- Admin gating: password OR bearer-admin ----------------
 function getBearer(request) {
   const h = request.headers.get("authorization") || "";
   const m = h.match(/^Bearer\s+(.+)$/i);
@@ -115,6 +114,46 @@ async function sha256Hex(str) {
   const buf = await crypto.subtle.digest("SHA-256", enc);
   return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+async function requireAuth(request, env) {
+  const token = getBearer(request);
+  if (!token) throw new Error("missing_authorization");
+  const tokenHash = await sha256Hex(token);
+  const row = await env.DB.prepare("SELECT username, expires_at FROM sessions WHERE token_hash=?1").bind(tokenHash).first();
+  if (!row) throw new Error("invalid_token");
+
+  const exp = row.expires_at ? Date.parse(row.expires_at) : NaN;
+  if (Number.isFinite(exp) && exp < Date.now()) {
+    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
+    throw new Error("token_expired");
+  }
+  return { user: row.username, tokenHash };
+}
+async function isBearerAdmin(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    const row = await env.DB.prepare("SELECT role, is_active FROM users WHERE username=?1").bind(auth.user).first();
+    const role = String(row?.role || "user").trim() || "user";
+    const active = Number(row?.is_active ?? 1) === 1;
+    return active && role.toLowerCase() === "admin";
+  } catch {
+    return false;
+  }
+}
+function isPasswordAdmin(request, env) {
+  const expected = String(env.ADMIN_PASSWORD || "").trim();
+  if (!expected) return false;
+  const got = String(request.headers.get("x-admin-password") || request.headers.get("X-Admin-Password") || "").trim();
+  return !!got && got === expected;
+}
+async function requireAdminEither(request, env) {
+  if (isPasswordAdmin(request, env)) return { ok: true, mode: "password" };
+  if (await isBearerAdmin(request, env)) return { ok: true, mode: "bearer" };
+  // If password isn't configured but bearer isn't admin, return a clear message:
+  const hasPw = !!String(env.ADMIN_PASSWORD || "").trim();
+  return { ok: false, status: 401, error: hasPw ? "not_admin" : "ADMIN_PASSWORD_not_configured_and_not_bearer_admin" };
+}
+
+// ---------------- AUTH (login/me/logout) ----------------
 function base64Url(bytes) {
   let bin = "";
   for (const b of bytes) bin += String.fromCharCode(b);
@@ -130,21 +169,7 @@ async function mintSession(env, username) {
     .bind(tokenHash, username, new Date().toISOString(), expires).run();
   return token;
 }
-async function requireAuth(request, env) {
-  const token = getBearer(request);
-  if (!token) throw new Error("missing_authorization");
-  const tokenHash = await sha256Hex(token);
-  const row = await env.DB.prepare("SELECT username, expires_at FROM sessions WHERE token_hash=?1").bind(tokenHash).first();
-  if (!row) throw new Error("invalid_token");
-  const exp = row.expires_at ? Date.parse(row.expires_at) : NaN;
-  if (Number.isFinite(exp) && exp < Date.now()) {
-    await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
-    throw new Error("token_expired");
-  }
-  return { user: row.username, tokenHash };
-}
-
-// PBKDF2 verify
+// users.password_hash format: pbkdf2$<iters>$<salt_b64url>$<hash_b64url>
 async function verifyPassword(password, stored, pepper) {
   const parts = String(stored || "").split("$");
   if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
@@ -176,7 +201,6 @@ function timingSafeEqual(a, b) {
   return r === 0;
 }
 
-// ---------------- AUTH handlers ----------------
 async function handleLogin(request, env) {
   const origin = request.headers.get("origin") || "";
   if (origin && !ALLOWED_ORIGINS.has(origin)) return new Response(JSON.stringify({ error: "origin_not_allowed", origin }), { status: 403, headers: { "Content-Type": "application/json" } });
@@ -189,8 +213,8 @@ async function handleLogin(request, env) {
   const password = String(body.password || "").trim();
   if (!user || !password) return new Response(JSON.stringify({ error: "missing_user_password" }), { status: 400, headers: { "Content-Type": "application/json" } });
 
-  const row = await env.DB.prepare("SELECT username, password_hash, role FROM users WHERE username=?1 AND is_active=1").bind(user).first();
-  if (!row) return new Response(JSON.stringify({ error: "invalid_credentials" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  const row = await env.DB.prepare("SELECT username, password_hash, role, is_active FROM users WHERE username=?1").bind(user).first();
+  if (!row || Number(row.is_active ?? 1) !== 1) return new Response(JSON.stringify({ error: "invalid_credentials" }), { status: 401, headers: { "Content-Type": "application/json" } });
 
   const ok = await verifyPassword(password, row.password_hash, env.PASSWORD_PEPPER || "");
   if (!ok) return new Response(JSON.stringify({ error: "invalid_credentials" }), { status: 401, headers: { "Content-Type": "application/json" } });
@@ -206,8 +230,8 @@ async function handleMe(request, env) {
     const row = await env.DB.prepare("SELECT role FROM users WHERE username=?1").bind(auth.user).first();
     const role = String(row?.role || "user").trim() || "user";
     return new Response(JSON.stringify({ ok: true, user: { username: auth.user, role } }), { status: 200, headers: { "Content-Type": "application/json" } });
-  } catch {
-    return new Response(JSON.stringify({ error: "unauthorized" }), { status: 401, headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    return new Response(JSON.stringify({ error: String(e?.message || "unauthorized") }), { status: 401, headers: { "Content-Type": "application/json" } });
   }
 }
 
@@ -223,7 +247,7 @@ async function handleLogout(request, env) {
   return new Response(JSON.stringify({ ok: true }), { status: 200, headers: { "Content-Type": "application/json" } });
 }
 
-// ---------------- CTO handlers ----------------
+// ---------------- CTO CRUD (D1) ----------------
 async function handleGetCtos(env) {
   const rs = await env.DB.prepare("SELECT CTO_ID, NOME, RUA, BAIRRO, LAT, LNG, CAPACIDADE, created_at, updated_at FROM ctos").all();
   const items = (rs.results || []).map((r) => ({
@@ -237,7 +261,6 @@ async function handleGetCtos(env) {
     created_at: r.created_at,
     updated_at: r.updated_at,
   })).filter((x) => x.cto_id && Number.isFinite(x.lat) && Number.isFinite(x.lng));
-
   return new Response(JSON.stringify(items), { status: 200, headers: { "Content-Type": "application/json", "Cache-Control": "no-store" } });
 }
 
@@ -245,7 +268,7 @@ async function handleUpsertCto(request, env) {
   const origin = request.headers.get("origin") || "";
   if (origin && !ALLOWED_ORIGINS.has(origin)) return new Response(JSON.stringify({ error: "origin_not_allowed", origin }), { status: 403, headers: { "Content-Type": "application/json" } });
 
-  const adm = requireAdmin(request, env);
+  const adm = await requireAdminEither(request, env);
   if (!adm.ok) return new Response(JSON.stringify({ error: adm.error }), { status: adm.status, headers: { "Content-Type": "application/json" } });
 
   const body = await readJson(request);
@@ -283,7 +306,7 @@ async function handleDeleteCto(request, env) {
   const origin = request.headers.get("origin") || "";
   if (origin && !ALLOWED_ORIGINS.has(origin)) return new Response(JSON.stringify({ error: "origin_not_allowed", origin }), { status: 403, headers: { "Content-Type": "application/json" } });
 
-  const adm = requireAdmin(request, env);
+  const adm = await requireAdminEither(request, env);
   if (!adm.ok) return new Response(JSON.stringify({ error: adm.error }), { status: adm.status, headers: { "Content-Type": "application/json" } });
 
   const url = new URL(request.url);
@@ -300,6 +323,7 @@ async function handleSubmit(request, env) {
   if (origin && !ALLOWED_ORIGINS.has(origin)) return new Response(JSON.stringify({ error: "origin_not_allowed", origin }), { status: 403, headers: { "Content-Type": "application/json" } });
 
   const auth = await requireAuth(request, env);
+
   const key = String(env.SUBMIT_KEY || "").trim();
   const scriptUrl = String(env.APPS_SCRIPT_URL || "").trim();
   if (!key) return new Response(JSON.stringify({ error: "SUBMIT_KEY_not_configured" }), { status: 500, headers: { "Content-Type": "application/json" } });
@@ -320,12 +344,16 @@ async function handleSubmit(request, env) {
   return new Response(text, { status: forward.status, headers: { "Content-Type": forward.headers.get("content-type") || "text/plain; charset=utf-8" } });
 }
 
-// ---------------- CSV endpoints ----------------
+// ---------------- CSV endpoints (never throw) ----------------
 async function fetchCSV(csvUrl) {
   if (!csvUrl) return [];
-  const res = await fetch(csvUrl, { cf: { cacheTtl: 60, cacheEverything: true }, headers: { "user-agent": "ftth-pwa-worker" } });
-  if (!res.ok) return [];
-  return parseCSV(await res.text());
+  try {
+    const res = await fetch(csvUrl, { cf: { cacheTtl: 60, cacheEverything: true }, headers: { "user-agent": "ftth-pwa-worker" } });
+    if (!res.ok) return [];
+    return parseCSV(await res.text());
+  } catch {
+    return [];
+  }
 }
 function parseCSV(text) {
   const lines = text.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.length > 0);
@@ -357,6 +385,14 @@ function splitCSVLine(line) {
   res.push(cur);
   return res;
 }
+function s(v) { return (v ?? "").toString().trim(); }
+function num(v) { const t = s(v).replace(",", "."); return Number(t); }
+function numOrNull(v) { const n = num(v); return Number.isFinite(n) ? n : null; }
+function intOrNull(v) { const t = s(v); if (!t) return null; const n = Number(t); return Number.isFinite(n) ? Math.trunc(n) : null; }
+function bool(v) { const t = s(v).toLowerCase(); return t === "1" || t === "true" || t === "sim" || t === "yes" || t === "y"; }
+function finite(n) { return Number.isFinite(n); }
+function uniq(arr) { return Array.from(new Set(arr)); }
+function avg(arr) { return arr.reduce((a,b)=>a+b,0) / arr.length; }
 
 async function getMovimentacoes(env) {
   const rows = await fetchCSV(env.SHEETS_MOVIMENTACOES_CSV_URL);
