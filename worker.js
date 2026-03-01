@@ -362,9 +362,31 @@ async function handleDeleteCto(request, env) {
 // ---------------- ADMIN USERS (Bearer-admin only) ----------------
 async function handleAdminListUsers(request, env) {
   await requireBearerAdmin(request, env);
-  const rs = await env.DB.prepare("SELECT username, role, is_active, created_at, updated_at, last_login FROM users ORDER BY username").all();
-  return new Response(JSON.stringify({ ok: true, users: rs.results || [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+
+  // Alguns bancos antigos não têm created_at/updated_at/last_login.
+  // Tenta a query completa; se falhar, faz fallback para colunas mínimas.
+  try {
+    const rs = await env.DB.prepare(
+      "SELECT username, role, is_active, created_at, updated_at, last_login FROM users ORDER BY username"
+    ).all();
+    return new Response(JSON.stringify({ ok: true, users: rs.results || [] }), { status: 200, headers: { "Content-Type": "application/json" } });
+  } catch (e) {
+    const rs2 = await env.DB.prepare(
+      "SELECT username, role, is_active FROM users ORDER BY username"
+    ).all();
+    // normaliza para o front não quebrar
+    const users = (rs2.results || []).map((u) => ({
+      username: u.username,
+      role: u.role,
+      is_active: u.is_active,
+      created_at: null,
+      updated_at: null,
+      last_login: null,
+    }));
+    return new Response(JSON.stringify({ ok: true, users, note: "fallback_columns" }), { status: 200, headers: { "Content-Type": "application/json" } });
+  }
 }
+
 
 async function handleAdminUpsertUser(request, env) {
   await requireBearerAdmin(request, env);
