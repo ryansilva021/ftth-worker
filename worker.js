@@ -1,32 +1,38 @@
 /**
  * FTTH-PWA Worker - Full (Login + CTOs + CE/CDO + Rotas + Movimentações) - 2026-03-01
  *
- * Fixes:
- * - Restores /api/login, /api/me, /api/logout (previous worker version removed them -> 404)
- * - Provides /api/ctos, /api/caixas_emenda_cdo, /api/rotas_fibras, /api/movimentacoes
- *
- * D1 tables used:
- * - users (username, password_hash, role, is_active, last_login? optional)
- * - sessions (token_hash, username, created_at, expires_at)
- * - ctos
- * - caixas_emenda_cdo          (matches your D1)
- * - rotas_fibras
- * - movimentacoes
+ * Token/Auth fixes (2026-03-01 PATCH):
+ * - Allow Cloudflare Pages preview subdomains: https://<branch>.ftth-pwa.pages.dev
+ * - Use the SAME origin allow-check for /api/login and CORS headers
+ * - Adds /api/admin/users (optional) to remove 404 noise in the frontend (admin-only)
  *
  * Auth model:
  * - /api/login returns token
  * - Client sends Authorization: Bearer <token>
- *
- * Notes:
- * - This worker is tolerant to missing optional columns (e.g., last_login).
  */
 
-const ALLOWED_ORIGINS = new Set([
+const STATIC_ALLOWED_ORIGINS = new Set([
   "https://ftth-pwa.pages.dev",
   "http://localhost:8788",
   "http://localhost:5173",
   "http://localhost:3000",
 ]);
+
+function isAllowedOrigin(origin) {
+  if (!origin) return true; // requests without Origin header
+  if (STATIC_ALLOWED_ORIGINS.has(origin)) return true;
+
+  // ✅ Cloudflare Pages preview domains: https://<branch>.ftth-pwa.pages.dev
+  // also accept https://ftth-pwa.pages.dev
+  try {
+    const u = new URL(origin);
+    if (u.protocol !== "https:") return false;
+    const host = u.host.toLowerCase();
+    if (host === "ftth-pwa.pages.dev") return true;
+    if (host.endsWith(".ftth-pwa.pages.dev")) return true;
+  } catch {}
+  return false;
+}
 
 export default {
   async fetch(request, env, ctx) {
@@ -45,7 +51,7 @@ export default {
       else await schemaPromise.catch(() => {});
 
       if (request.method === "GET" && (p === "/" || p === "/api" || p === "/api/")) {
-        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-full" });
+        return corsJson(request, { ok: true, service: "ftth-pwa", version: "2026-03-01-full+originfix" });
       }
 
       // AUTH
@@ -53,12 +59,15 @@ export default {
       if (p === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
       if (p === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
 
+      // ADMIN (optional)
+      if (p === "/api/admin/users" && request.method === "GET") return corsResponse(request, await handleAdminUsers(request, env));
+
       // CTOs
       if (p === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(env));
       if (p === "/api/ctos" && request.method === "POST") return corsResponse(request, await handleUpsertCto(request, env));
       if (p === "/api/ctos" && request.method === "DELETE") return corsResponse(request, await handleDeleteCto(request, env));
 
-      // CE/CDO (endpoint name fixed, table name matches your D1)
+      // CE/CDO (table name matches D1)
       if (p === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCeCdo(env));
       if (p === "/api/caixas_emenda_cdo" && request.method === "POST") return corsResponse(request, await handleUpsertCeCdo(request, env));
       if (p === "/api/caixas_emenda_cdo" && request.method === "DELETE") return corsResponse(request, await handleDeleteCeCdo(request, env));
@@ -85,7 +94,7 @@ export default {
 // ---------------- CORS ----------------
 function corsHeaders(request) {
   const origin = request.headers.get("origin") || "";
-  const allowOrigin = ALLOWED_ORIGINS.has(origin) ? origin : "*";
+  const allowOrigin = isAllowedOrigin(origin) ? origin : "*";
   return {
     "Access-Control-Allow-Origin": allowOrigin,
     "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
@@ -136,7 +145,6 @@ async function ensureSchema(env) {
   );`);
   await env.DB.exec(`CREATE INDEX IF NOT EXISTS idx_ctos_lat_lng ON ctos(lat, lng);`);
 
-  // ✅ Matches your D1 table
   await env.DB.exec(`CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (
     id TEXT PRIMARY KEY,
     nome TEXT,
@@ -238,6 +246,7 @@ async function mintSession(env, username) {
     .run();
   return token;
 }
+
 async function requireAuth(request, env) {
   const token = getBearer(request);
   if (!token) throw new Error("missing_authorization");
@@ -254,10 +263,19 @@ async function requireAuth(request, env) {
   return { username: row.username, tokenHash };
 }
 
+async function requireAdmin(request, env) {
+  const auth = await requireAuth(request, env);
+  const row = await env.DB.prepare("SELECT role, is_active FROM users WHERE username=?1").bind(auth.username).first();
+  const role = String(row?.role || "user").toLowerCase();
+  if (!row || Number(row.is_active ?? 1) !== 1) throw new Error("user_inactive");
+  if (role !== "admin") throw new Error("forbidden");
+  return { ...auth, role };
+}
+
 // ---------------- AUTH endpoints ----------------
 async function handleLogin(request, env) {
   const origin = request.headers.get("origin") || "";
-  if (origin && !ALLOWED_ORIGINS.has(origin)) return jsonResponse({ error: "origin_not_allowed", origin }, 403);
+  if (origin && !isAllowedOrigin(origin)) return jsonResponse({ error: "origin_not_allowed", origin }, 403);
 
   const body = await readJson(request);
   if (!body) return jsonResponse({ error: "invalid_json" }, 400);
@@ -283,6 +301,7 @@ async function handleLogin(request, env) {
 
   return jsonResponse({ ok: true, token, user: { username: user, role: String(row.role || "user") } }, 200);
 }
+
 async function handleMe(request, env) {
   try {
     const auth = await requireAuth(request, env);
@@ -293,12 +312,26 @@ async function handleMe(request, env) {
     return jsonResponse({ error: String(e?.message || "unauthorized") }, 401);
   }
 }
+
 async function handleLogout(request, env) {
   try {
     const auth = await requireAuth(request, env);
     await env.DB.prepare("DELETE FROM sessions WHERE token_hash=?1").bind(auth.tokenHash).run();
   } catch {}
   return jsonResponse({ ok: true }, 200);
+}
+
+// ---------------- ADMIN endpoints ----------------
+async function handleAdminUsers(request, env) {
+  try {
+    await requireAdmin(request, env);
+    const rs = await env.DB.prepare("SELECT username, role, is_active FROM users ORDER BY username ASC").all();
+    return jsonResponse({ ok: true, users: rs.results || [] }, 200);
+  } catch (e) {
+    const msg = String(e?.message || "forbidden");
+    const status = msg === "forbidden" ? 403 : 401;
+    return jsonResponse({ ok: false, error: msg }, status);
+  }
 }
 
 // ---------------- DTO helpers ----------------
