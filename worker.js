@@ -16,6 +16,12 @@ export default {
   if (pathname === "/api/rotas_fibras" && request.method !== "GET") {
     pathname = "/api/rotas";
   }
+
+  // Alias: /api/caixas -> /api/caixas_emenda_cdo (front/backward compatibility)
+  if (pathname === "/api/caixas") {
+    pathname = "/api/caixas_emenda_cdo";
+  }
+
 // CORS preflight
       if (request.method === "OPTIONS") return corsResponse(request, new Response(null, { status: 204 }));
 
