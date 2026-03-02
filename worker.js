@@ -838,34 +838,56 @@ const rows = await db(env).prepare(
 async function handleGetRotas(request, env) {
   try {
     await requireViewer(request, env);
+    await ensureSchema(env);
 
-        await ensureSchema(env);
-const rows = await db(env).prepare(
-      "SELECT rota_id, nome, geojson, updated_at FROM rotas ORDER BY rota_id"
-    ).all();
+    const url = new URL(request.url);
+    const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "");
+    const rows = await db(env).prepare(
+      rotaIdFilter
+        ? "SELECT rota_id, nome, geojson, updated_at FROM rotas WHERE rota_id=?1"
+        : "SELECT rota_id, nome, geojson, updated_at FROM rotas ORDER BY rota_id"
+    ).bind(rotaIdFilter).all();
 
+    const items = [];
     const features = [];
+
     for (const r of (rows?.results || [])) {
+      const rota_id = s(r.rota_id || r.ROTA_ID || r.id || r.ID);
+      const nome = s(r.nome || r.NOME);
+      const updated_at = s(r.updated_at || r.updatedAt);
+
+      items.push({ rota_id, nome, updated_at });
+
       const raw = r.geojson;
       if (!raw) continue;
+
       let gj = null;
       try {
         gj = (typeof raw === "string") ? JSON.parse(raw) : raw;
-      } catch (_e) {
-        // ignore invalid JSON rows
-        continue;
-      }
-      if (!gj) continue;
+      } catch (_e) { continue; }
+
+      const attachProps = (f) => {
+        if (!f || f.type !== "Feature") return null;
+        const p = (f.properties && typeof f.properties === "object") ? f.properties : {};
+        return {
+          ...f,
+          properties: { ...p, rota_id, nome }
+        };
+      };
 
       if (gj.type === "FeatureCollection" && Array.isArray(gj.features)) {
-        for (const f of gj.features) if (f && f.type === "Feature") features.push(f);
+        for (const f of gj.features) {
+          const ff = attachProps(f);
+          if (ff) features.push(ff);
+        }
       } else if (gj.type === "Feature") {
-        features.push(gj);
+        const ff = attachProps(gj);
+        if (ff) features.push(ff);
       }
     }
 
     const geojson = { type: "FeatureCollection", features };
-    return json({ ok: true, geojson, data: geojson }, 200, { cacheSeconds: 5 });
+    return json({ ok: true, geojson, items, data: geojson }, 200, { cacheSeconds: 5 });
   } catch (e) {
     const msg = String(e?.message || e);
     if (msg.includes("no such table") || msg.includes("no such column")) {
