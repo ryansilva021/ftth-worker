@@ -276,6 +276,59 @@ async function handleLogout(request, env) {
 }
 
 
+
+async function ensureSchema(env) {
+  // Create/patch tables as needed (best-effort). This avoids 500s when the table exists with missing columns.
+  // Rotas
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS rotas (rota_id TEXT PRIMARY KEY, nome TEXT, geojson TEXT NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // CTOs
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS ctos (cto_id TEXT PRIMARY KEY, nome TEXT, rua TEXT, bairro TEXT, capacidade INTEGER, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // CE/CDO table (existing in your D1): caixas_emenda_cdo
+  // We patch missing columns with ALTER TABLE ADD COLUMN (best-effort).
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (id TEXT PRIMARY KEY, tipo TEXT, obs TEXT, img_url TEXT, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // Patch missing columns (if table existed with partial schema)
+  const colsToEnsure = [
+    ["tipo","TEXT"], ["obs","TEXT"], ["img_url","TEXT"],
+    ["lat","REAL"], ["lng","REAL"], ["updated_at","TEXT"]
+  ];
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(caixas_emenda_cdo)").all();
+    const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
+    for (const [c,t] of colsToEnsure) {
+      if (!have.has(c)) {
+        try { await db(env).prepare(`ALTER TABLE caixas_emenda_cdo ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+
+  // Patch rotas columns if needed
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(rotas)").all();
+    const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
+    const cols = [["nome","TEXT"],["geojson","TEXT"],["updated_at","TEXT"]];
+    for (const [c,t] of cols) {
+      if (!have.has(c)) {
+        try { await db(env).prepare(`ALTER TABLE rotas ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+}
+
 async function safeLog(env, entry) {
   // Optional: if table log_eventos exists, store logs; otherwise ignore.
   try {
@@ -430,7 +483,8 @@ function extractRota(body) {
 async function handleCrudCtos(request, env) {
   try {
     const auth = await requireRole(request, env, ["admin"]);
-    const body = await readJson(request) || {};
+        await ensureSchema(env);
+const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
     const cto = extractCto(body);
 
@@ -440,9 +494,8 @@ async function handleCrudCtos(request, env) {
     if (action === "DELETE") {
       await db(env).prepare("DELETE FROM ctos WHERE cto_id=?1").bind(cto.CTO_ID).run();
     } else {
-      await db(env).prepare(
-        "INSERT INTO ctos (cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8) " +
-        "ON CONFLICT(cto_id) DO UPDATE SET nome=excluded.nome, rua=excluded.rua, bairro=excluded.bairro, capacidade=excluded.capacidade, lat=excluded.lat, lng=excluded.lng, updated_at=excluded.updated_at"
+      const upd = await db(env).prepare(
+        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8 WHERE cto_id=?1"
       ).bind(
         cto.CTO_ID,
         s(cto.NOME),
@@ -453,6 +506,21 @@ async function handleCrudCtos(request, env) {
         num(cto.LNG),
         new Date().toISOString()
       ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO ctos (cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
+        ).bind(
+          cto.CTO_ID,
+          s(cto.NOME),
+          s(cto.RUA),
+          s(cto.BAIRRO),
+          intOrNull(cto.CAPACIDADE),
+          num(cto.LAT),
+          num(cto.LNG),
+          new Date().toISOString()
+        ).run();
+      }
     }
 
     // log
@@ -477,7 +545,8 @@ async function handleCrudCtos(request, env) {
 async function handleCrudCaixas(request, env) {
   try {
     const auth = await requireRole(request, env, ["admin"]);
-    const body = await readJson(request) || {};
+        await ensureSchema(env);
+const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
     const cx = extractCaixa(body);
 
@@ -487,9 +556,9 @@ async function handleCrudCaixas(request, env) {
     if (action === "DELETE") {
       await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1").bind(cx.ID).run();
     } else {
-      await db(env).prepare(
-        "INSERT INTO caixas_emenda_cdo (id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7) " +
-        "ON CONFLICT(id) DO UPDATE SET tipo=excluded.tipo, obs=excluded.obs, img_url=excluded.img_url, lat=excluded.lat, lng=excluded.lng, updated_at=excluded.updated_at"
+      // Update first (works even if no UNIQUE constraint; if none matched, insert)
+      const upd = await db(env).prepare(
+        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7 WHERE id=?1"
       ).bind(
         cx.ID,
         s(cx.TIPO),
@@ -499,6 +568,20 @@ async function handleCrudCaixas(request, env) {
         num(cx.LNG),
         new Date().toISOString()
       ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO caixas_emenda_cdo (id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+        ).bind(
+          cx.ID,
+          s(cx.TIPO),
+          s(cx.OBS),
+          s(cx.IMG_URL),
+          num(cx.LAT),
+          num(cx.LNG),
+          new Date().toISOString()
+        ).run();
+      }
     }
 
     await safeLog(env, {
@@ -522,7 +605,8 @@ async function handleCrudCaixas(request, env) {
 async function handleCrudRotas(request, env) {
   try {
     const auth = await requireRole(request, env, ["admin"]);
-    const body = await readJson(request) || {};
+        await ensureSchema(env);
+const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
 
     const rota_id = s(body.rota_id || body.ROTA_ID || body.id || body.ID);
@@ -539,15 +623,25 @@ async function handleCrudRotas(request, env) {
       }
       // normalize to string
       const geojsonText = (typeof geojsonRaw === "string") ? geojsonRaw : JSON.stringify(geojsonRaw || {});
-      await db(env).prepare(
-        "INSERT INTO rotas (rota_id, nome, geojson, updated_at) VALUES (?1,?2,?3,?4) " +
-        "ON CONFLICT(rota_id) DO UPDATE SET nome=excluded.nome, geojson=excluded.geojson, updated_at=excluded.updated_at"
+      const upd = await db(env).prepare(
+        "UPDATE rotas SET nome=?2, geojson=?3, updated_at=?4 WHERE rota_id=?1"
       ).bind(
         rota_id,
         nome,
         geojsonText,
         new Date().toISOString()
       ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO rotas (rota_id, nome, geojson, updated_at) VALUES (?1,?2,?3,?4)"
+        ).bind(
+          rota_id,
+          nome,
+          geojsonText,
+          new Date().toISOString()
+        ).run();
+      }
     }
 
     await safeLog(env, {
@@ -644,7 +738,8 @@ async function handleGetCtos(request, env) {
   try {
     await requireViewer(request, env);
 
-    const rows = await db(env).prepare(
+        await ensureSchema(env);
+const rows = await db(env).prepare(
       "SELECT cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at FROM ctos ORDER BY cto_id"
     ).all();
 
@@ -686,25 +781,27 @@ async function handleGetCaixas(request, env) {
   try {
     await requireViewer(request, env);
 
-    const rows = await db(env).prepare(
-      "SELECT id, tipo, obs, img_url, lat, lng, updated_at FROM caixas_emenda_cdo ORDER BY id"
+        await ensureSchema(env);
+const rows = await db(env).prepare(
+      "SELECT * FROM caixas_emenda_cdo ORDER BY id"
     ).all();
 
-    const items = (rows?.results || []).map(r => ({
-      ID: s(r.id),
-      id: s(r.id),
-      TIPO: s(r.tipo),
-      tipo: s(r.tipo),
-      OBS: s(r.obs),
-      obs: s(r.obs),
-      IMG_URL: s(r.img_url),
-      img_url: s(r.img_url),
-      LAT: num(r.lat),
-      LNG: num(r.lng),
-      lat: num(r.lat),
-      lng: num(r.lng),
-      updated_at: s(r.updated_at)
-    })).filter(x => x.id && finite(x.lat) && finite(x.lng));
+    const items = (rows?.results || []).map(r => {
+      const id = s(r.id || r.caixa_id || r.ID || r.codigo || r.code);
+      const tipo = s(r.tipo || r.TIPO || r.type);
+      const obs = s(r.obs || r.OBS || r.observacao || r.observações || r.observacao_txt);
+      const img_url = s(r.img_url || r.IMG_URL || r.foto || r.url || r.image);
+      const lat = num(r.lat ?? r.latitude ?? r.LAT ?? r.Latitude);
+      const lng = num(r.lng ?? r.longitude ?? r.LNG ?? r.Longitude);
+      return {
+        ID: id, id,
+        TIPO: tipo, tipo,
+        OBS: obs, obs,
+        IMG_URL: img_url, img_url,
+        LAT: lat, LNG: lng, lat, lng,
+        updated_at: s(r.updated_at || r.updatedAt || r.atualizado_em || r.ts)
+      };
+    }).filter(x => x.id && finite(x.lat) && finite(x.lng));
 
     return json({ ok: true, items, data: items }, 200, { cacheSeconds: 5 });
   } catch (e) {
@@ -720,7 +817,8 @@ async function handleGetRotas(request, env) {
   try {
     await requireViewer(request, env);
 
-    const rows = await db(env).prepare(
+        await ensureSchema(env);
+const rows = await db(env).prepare(
       "SELECT rota_id, nome, geojson, updated_at FROM rotas ORDER BY rota_id"
     ).all();
 
