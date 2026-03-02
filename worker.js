@@ -544,7 +544,8 @@ const body = await readJson(request) || {};
   } catch (e) {
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
-    return json({ ok: false, error: "cto_crud_failed", message: String(e?.stack || e) }, 500);
+    return json({ ok: false, error: "cto_crud_failed", message: String(e?.stack || e), hint: "Verifique colunas da tabela ctos (cto_id/nome/rua/bairro/capacidade/lat/lng). Se sua tabela usa outros nomes, avise que eu ajusto." }, 500);
+  // cto_crud_fallback
   }
 }
 
@@ -743,41 +744,56 @@ async function requireViewer(request, env) {
 async function handleGetCtos(request, env) {
   try {
     await requireViewer(request, env);
+    await ensureSchema(env);
 
-        await ensureSchema(env);
-const rows = await db(env).prepare(
-      "SELECT cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at FROM ctos ORDER BY cto_id"
+    const rows = await db(env).prepare(
+      "SELECT * FROM ctos ORDER BY cto_id"
     ).all();
 
-    const items = (rows?.results || []).map(r => ({
-      CTO_ID: s(r.cto_id),
-      cto_id: s(r.cto_id),
-      NOME: s(r.nome),
-      nome: s(r.nome),
-      RUA: s(r.rua),
-      rua: s(r.rua),
-      BAIRRO: s(r.bairro),
-      bairro: s(r.bairro),
-      CAPACIDADE: intOrNull(r.capacidade),
-      capacidade: intOrNull(r.capacidade),
-      LAT: num(r.lat),
-      LNG: num(r.lng),
-      lat: num(r.lat),
-      lng: num(r.lng),
-      updated_at: s(r.updated_at)
-    })).filter(x => x.cto_id && finite(x.lat) && finite(x.lng));
+    const items = (rows?.results || []).map(r => {
+      const cto_id = s(r.cto_id || r.CTO_ID || r.id || r.ID || r.codigo || r.code);
+      const nome = s(r.nome || r.NOME || r.name);
+      const rua = s(r.rua || r.RUA);
+      const bairro = s(r.bairro || r.BAIRRO);
+      const capacidade = intOrNull(r.capacidade ?? r.CAPACIDADE);
+      const lat = num(r.lat ?? r.LAT ?? r.latitude ?? r.Latitude);
+      const lng = num(r.lng ?? r.LNG ?? r.longitude ?? r.Longitude);
+      return {
+        CTO_ID: cto_id,
+        cto_id,
+        NOME: nome,
+        nome,
+        RUA: rua,
+        rua,
+        BAIRRO: bairro,
+        bairro,
+        CAPACIDADE: capacidade,
+        capacidade,
+        LAT: lat,
+        LNG: lng,
+        lat,
+        lng,
+        updated_at: s(r.updated_at || r.updatedAt || r.atualizado_em || r.ts),
+        created_at: s(r.created_at || r.createdAt)
+      };
+    }).filter(x => finite(x.lat) && finite(x.lng));
+
+    // If some rows lack id, synthesize stable ids from rowid
+    for (let i=0;i<items.length;i++){
+      if (!items[i].cto_id){
+        const row = (rows?.results || [])[i];
+        const rid = row && (row.rowid || row.ROWID);
+        const sid = rid ? `CTO-${rid}` : `CTO-${i+1}`;
+        items[i].cto_id = sid;
+        items[i].CTO_ID = sid;
+      }
+    }
 
     return json({ ok: true, items, data: items }, 200, { cacheSeconds: 5 });
   } catch (e) {
-    // Helpful hint if tables aren't created
     const msg = String(e?.message || e);
     if (msg.includes("no such table") || msg.includes("no such column")) {
-      return json({
-        ok: false,
-        error: "d1_schema_missing",
-        message: msg,
-        hint: "Crie as tabelas D1: ctos, caixas, rotas (veja o SQL no README/assistente)."
-      }, 500);
+      return json({ ok: false, error: "d1_schema_missing", message: msg }, 500);
     }
     return json({ ok: false, error: "ctos_failed", message: msg }, 500);
   }
