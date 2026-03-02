@@ -10,9 +10,13 @@ export default {
   async fetch(request, env, ctx) {
     try {
       const url = new URL(request.url);
-      const { pathname } = url;
+      let { pathname } = url;
 
-      // CORS preflight
+  // Alias: keep GET /api/rotas_fibras (GeoJSON export), but route writes to /api/rotas for backward-compat.
+  if (pathname === "/api/rotas_fibras" && request.method !== "GET") {
+    pathname = "/api/rotas";
+  }
+// CORS preflight
       if (request.method === "OPTIONS") return corsResponse(request, new Response(null, { status: 204 }));
 
       // Health / root
