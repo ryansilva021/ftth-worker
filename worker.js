@@ -841,24 +841,31 @@ async function handleGetRotas(request, env) {
     await ensureSchema(env);
 
     const url = new URL(request.url);
-    const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "");
-    const rows = await db(env).prepare(
-      rotaIdFilter
-        ? "SELECT rota_id, nome, geojson, updated_at FROM rotas WHERE rota_id=?1"
-        : "SELECT rota_id, nome, geojson, updated_at FROM rotas ORDER BY rota_id"
-    ).bind(rotaIdFilter).all();
+    const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "").trim();
+
+    // Schema-flexible read
+    const rows = await db(env).prepare("SELECT * FROM rotas").all();
 
     const items = [];
     const features = [];
 
+    const pick = (r, keys) => {
+      for (const k of keys) {
+        if (r && Object.prototype.hasOwnProperty.call(r, k) && r[k] !== undefined && r[k] !== null) return r[k];
+      }
+      return undefined;
+    };
+
     for (const r of (rows?.results || [])) {
-      const rota_id = s(r.rota_id || r.ROTA_ID || r.id || r.ID);
-      const nome = s(r.nome || r.NOME);
-      const updated_at = s(r.updated_at || r.updatedAt);
+      const rota_id = s(pick(r, ["rota_id","ROTA_ID","id","ID","codigo","CODE"]));
+      if (rotaIdFilter && rota_id !== rotaIdFilter) continue;
+
+      const nome = s(pick(r, ["nome","NOME","name"]));
+      const updated_at = s(pick(r, ["updated_at","UPDATED_AT","updatedAt","atualizado_em","ts"]));
 
       items.push({ rota_id, nome, updated_at });
 
-      const raw = r.geojson;
+      const raw = pick(r, ["geojson","GEOJSON","data","DATA","geom","GEOM","geometry","GEOMETRY","json","JSON"]);
       if (!raw) continue;
 
       let gj = null;
@@ -869,10 +876,7 @@ async function handleGetRotas(request, env) {
       const attachProps = (f) => {
         if (!f || f.type !== "Feature") return null;
         const p = (f.properties && typeof f.properties === "object") ? f.properties : {};
-        return {
-          ...f,
-          properties: { ...p, rota_id, nome }
-        };
+        return { ...f, properties: { ...p, rota_id, nome } };
       };
 
       if (gj.type === "FeatureCollection" && Array.isArray(gj.features)) {
@@ -883,6 +887,9 @@ async function handleGetRotas(request, env) {
       } else if (gj.type === "Feature") {
         const ff = attachProps(gj);
         if (ff) features.push(ff);
+      } else if (gj.type === "LineString") {
+        // If stored as bare geometry
+        features.push(attachProps({ type:"Feature", properties:{}, geometry: gj }));
       }
     }
 
@@ -890,9 +897,6 @@ async function handleGetRotas(request, env) {
     return json({ ok: true, geojson, items, data: geojson }, 200, { cacheSeconds: 5 });
   } catch (e) {
     const msg = String(e?.message || e);
-    if (msg.includes("no such table") || msg.includes("no such column")) {
-      return json({ ok: false, error: "d1_schema_missing", message: msg }, 500);
-    }
     return json({ ok: false, error: "rotas_failed", message: msg }, 500);
   }
 }
