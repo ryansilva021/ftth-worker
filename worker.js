@@ -42,6 +42,7 @@ export default {
             "POST /api/caixas_emenda_cdo (admin)",
             "DELETE /api/caixas_emenda_cdo (admin)",
             "GET  /api/rotas_fibras",
+            "GET  /api/rotas",
             "POST /api/rotas (admin)",
             "DELETE /api/rotas (admin)",
             "GET  /api/movimentacoes",
@@ -73,6 +74,7 @@ export default {
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
       if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
+      if (pathname === "/api/rotas" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
       if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env));
       if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
