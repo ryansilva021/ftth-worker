@@ -90,16 +90,9 @@ function isWriteMethod(m) {
 
 
 function db(env) {
-  // Be tolerant with binding names across deployments.
-  // Priority: existing legacy DB (most likely), then B1, then any other common names.
-  const d =
-    env.DB ||
-    env.B1 ||
-    env.FTTH_DB ||
-    env.ftth_db ||
-    env.D1 ||
-    env.database;
-  if (!d) throw new Error("Missing D1 binding. Bind your database as DB or B1 (or FTTH_DB).");
+  // Prefer the user-requested D1 binding name "B1"; fall back to legacy "DB" if present.
+  const d = env.B1 || env.DB;
+  if (!d) throw new Error("Missing D1 binding. Bind your database as B1 (preferred) or DB (legacy).");
   return d;
 }
 
@@ -123,6 +116,22 @@ function corsResponse(request, response) {
 function corsJson(request, obj, status = 200) {
   return corsResponse(request, json(obj, status));
 }
+function pickDb(env){
+  if (env.DB) return { db: env.DB, name: "DB" };
+  if (env.B1) return { db: env.B1, name: "B1" };
+  if (env.D1) return { db: env.D1, name: "D1" };
+  if (env.FTTH_DB) return { db: env.FTTH_DB, name: "FTTH_DB" };
+  for (const k of Object.keys(env)){
+    const v = env[k];
+    if (v && typeof v.prepare === "function" && typeof v.exec === "function"){
+      return { db: v, name: k };
+    }
+  }
+  return { db: null, name: null };
+}
+
+function db(env){ return pickDb(env).db; }
+
 function json(obj, status = 200, headers = {}) {
   const extra = headers?.cacheSeconds
     ? { "Cache-Control": `public, max-age=${Number(headers.cacheSeconds) || 0}` }
@@ -267,7 +276,8 @@ async function handleLogin(request, env) {
 
   const role = normalizeRole(user.role);
   const token = await mintSession(env, username);
-  return json({ ok: true, token, user: { username, role } });
+  const _pick = pickDb(env);
+      return json({ ok:true, token, user: { username, role } });
 }
 async function handleMe(request, env) {
   try {
@@ -275,7 +285,7 @@ async function handleMe(request, env) {
     const role = await getUserRole(env, auth.user);
     return json({ ok: true, user: { username: auth.user, role } });
   } catch (_e) {
-    return json({ error: "unauthorized" }, 401);
+    return json({ error: "unauthorized", hint: "missing/invalid token or session not found in D1" }, 401);
   }
 }
 async function handleLogout(request, env) {
