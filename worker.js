@@ -73,6 +73,7 @@ export default {
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
       if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
+      if (pathname === "/api/rotas" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
       if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env));
       if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
@@ -89,12 +90,7 @@ function isWriteMethod(m) {
 }
 
 
-function db(env) {
-  // Prefer the user-requested D1 binding name "B1"; fall back to legacy "DB" if present.
-  const d = env.B1 || env.DB;
-  if (!d) throw new Error("Missing D1 binding. Bind your database as B1 (preferred) or DB (legacy).");
-  return d;
-}
+function db(env){ return pickDb(env).db; }
 
 // ======================= CORS helpers =======================
 function corsHeaders(request) {
@@ -129,8 +125,6 @@ function pickDb(env){
   }
   return { db: null, name: null };
 }
-
-function db(env){ return pickDb(env).db; }
 
 function json(obj, status = 200, headers = {}) {
   const extra = headers?.cacheSeconds
@@ -285,7 +279,7 @@ async function handleMe(request, env) {
     const role = await getUserRole(env, auth.user);
     return json({ ok: true, user: { username: auth.user, role } });
   } catch (_e) {
-    return json({ error: "unauthorized", hint: "missing/invalid token or session not found in D1" }, 401);
+    return json({ error: "unauthorized" }, 401);
   }
 }
 async function handleLogout(request, env) {
