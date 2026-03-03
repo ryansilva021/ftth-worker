@@ -1,238 +1,964 @@
-// FTTH Worker - unified API for CTOS, CE/CDO and Rotas (D1)
-// IMPORTANT: set a D1 binding (recommended name: DB) and a Secret ADMIN_TOKEN in Cloudflare Worker settings.
-
-function json(data, status = 200, headers = {}) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      "content-type": "application/json; charset=utf-8",
-      ...headers,
-    },
-  });
-}
-
-function corsHeaders(req) {
-  const origin = req.headers.get("origin") || "*";
-  return {
-    "access-control-allow-origin": origin,
-    "access-control-allow-credentials": "true",
-    "access-control-allow-headers": "content-type, x-admin-token, authorization",
-    "access-control-allow-methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "vary": "origin",
-  };
-}
-
-function pickDb(env) {
-  // Prefer common binding names.
-  const candidates = ["DB", "FTTH_DB", "D1", "DATABASE", "db", "ftth_db"];
-  for (const k of candidates) {
-    if (env && env[k] && typeof env[k].prepare === "function") return { binding: k, db: env[k] };
-  }
-  return { binding: null, db: null };
-}
-
-function requireAdmin(req, env) {
-  const configured = (env && env.ADMIN_TOKEN) ? String(env.ADMIN_TOKEN) : "";
-  if (!configured) return { ok: true, reason: "no_admin_token_configured" }; // dev-friendly
-  const tok = req.headers.get("x-admin-token") || "";
-  const auth = req.headers.get("authorization") || "";
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : "";
-  const provided = tok || bearer;
-  if (!provided) return { ok: false, reason: "missing_token" };
-  if (provided !== configured) return { ok: false, reason: "invalid_token" };
-  return { ok: true };
-}
-
-async function ensureSchema(db) {
-  // Create tables if missing (safe/no-op if they exist).
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS ctos (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      lat REAL,
-      lng REAL,
-      capacidade INTEGER,
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      lat REAL,
-      lng REAL,
-      created_at TEXT DEFAULT (datetime('now')),
-      updated_at TEXT DEFAULT (datetime('now'))
-    );
-    CREATE TABLE IF NOT EXISTS rotas (
-      rota_id TEXT PRIMARY KEY,
-      nome TEXT,
-      geojson TEXT,
-      updated_at TEXT DEFAULT (datetime('now'))
-    );
-  `);
-}
-
-async function handleRotas(req, env, url) {
-  const { db } = pickDb(env);
-  if (!db) return json({ error: "D1 binding not found. Configure a D1 binding (e.g., DB) on the Worker." }, 500, corsHeaders(req));
-  await ensureSchema(db);
-
-  // Method override support (POST with _method)
-  let method = req.method.toUpperCase();
-  let body = null;
-  if (method !== "GET" && method !== "OPTIONS") {
-    const ct = req.headers.get("content-type") || "";
-    if (ct.includes("application/json")) {
-      body = await req.json().catch(() => null);
-      if (method === "POST" && body && body._method) method = String(body._method).toUpperCase();
-    }
-  }
-
-  if (method === "GET") {
-    const rows = await db.prepare("SELECT rota_id, nome, geojson, updated_at FROM rotas ORDER BY updated_at DESC").all();
-    return json({ ok: true, rotas: rows.results || [] }, 200, corsHeaders(req));
-  }
-
-  // Mutations require admin
-  const auth = requireAdmin(req, env);
-  if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401, corsHeaders(req));
-
-  if (method === "PUT" || method === "POST") {
-    const rota_id = String(body?.rota_id || body?.id || "").trim();
-    const nome = String(body?.nome || "").trim();
-    const geojson = body?.geojson == null ? null : String(body.geojson);
-    if (!rota_id) return json({ error: "rota_id_required" }, 400, corsHeaders(req));
-
-    await db.prepare(
-      "INSERT INTO rotas (rota_id, nome, geojson, updated_at) VALUES (?1, ?2, ?3, datetime('now')) " +
-      "ON CONFLICT(rota_id) DO UPDATE SET nome=excluded.nome, geojson=excluded.geojson, updated_at=datetime('now')"
-    ).bind(rota_id, nome, geojson).run();
-
-    return json({ ok: true, rota_id }, 200, corsHeaders(req));
-  }
-
-  if (method === "DELETE") {
-    const rota_id = String(body?.rota_id || body?.id || url.searchParams.get("rota_id") || "").trim();
-    if (!rota_id) return json({ error: "rota_id_required" }, 400, corsHeaders(req));
-    await db.prepare("DELETE FROM rotas WHERE rota_id=?1").bind(rota_id).run();
-    return json({ ok: true, rota_id }, 200, corsHeaders(req));
-  }
-
-  return json({ error: "method_not_allowed" }, 405, corsHeaders(req));
-}
-
-async function handleCtos(req, env) {
-  const { db } = pickDb(env);
-  if (!db) return json({ error: "D1 binding not found" }, 500, corsHeaders(req));
-  await ensureSchema(db);
-
-  if (req.method === "GET") {
-    const rows = await db.prepare("SELECT id, lat, lng, capacidade, created_at, updated_at FROM ctos ORDER BY id DESC").all();
-    return json({ ok: true, ctos: rows.results || [] }, 200, corsHeaders(req));
-  }
-
-  const auth = requireAdmin(req, env);
-  if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401, corsHeaders(req));
-
-  const body = await req.json().catch(() => null);
-  const method = (req.method === "POST" && body && body._method) ? String(body._method).toUpperCase() : req.method.toUpperCase();
-
-  if (method === "POST" || method === "PUT") {
-    const id = body?.id ?? null;
-    const lat = Number(body?.lat);
-    const lng = Number(body?.lng);
-    const capacidade = body?.capacidade == null ? null : Number(body.capacidade);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return json({ error: "lat_lng_required" }, 400, corsHeaders(req));
-
-    if (id) {
-      await db.prepare("UPDATE ctos SET lat=?1, lng=?2, capacidade=?3, updated_at=datetime('now') WHERE id=?4")
-        .bind(lat, lng, capacidade, id).run();
-      return json({ ok: true, id }, 200, corsHeaders(req));
-    } else {
-      const r = await db.prepare("INSERT INTO ctos (lat, lng, capacidade) VALUES (?1, ?2, ?3)")
-        .bind(lat, lng, capacidade).run();
-      return json({ ok: true, id: r.meta?.last_row_id }, 200, corsHeaders(req));
-    }
-  }
-
-  if (method === "DELETE") {
-    const id = body?.id;
-    if (!id) return json({ error: "id_required" }, 400, corsHeaders(req));
-    await db.prepare("DELETE FROM ctos WHERE id=?1").bind(id).run();
-    return json({ ok: true, id }, 200, corsHeaders(req));
-  }
-
-  return json({ error: "method_not_allowed" }, 405, corsHeaders(req));
-}
-
-async function handleCaixas(req, env) {
-  const { db } = pickDb(env);
-  if (!db) return json({ error: "D1 binding not found" }, 500, corsHeaders(req));
-  await ensureSchema(db);
-
-  if (req.method === "GET") {
-    const rows = await db.prepare("SELECT id, lat, lng, created_at, updated_at FROM caixas_emenda_cdo ORDER BY id DESC").all();
-    return json({ ok: true, caixas: rows.results || [] }, 200, corsHeaders(req));
-  }
-
-  const auth = requireAdmin(req, env);
-  if (!auth.ok) return json({ error: "unauthorized", reason: auth.reason }, 401, corsHeaders(req));
-
-  const body = await req.json().catch(() => null);
-  const method = (req.method === "POST" && body && body._method) ? String(body._method).toUpperCase() : req.method.toUpperCase();
-
-  if (method === "POST" || method === "PUT") {
-    const id = body?.id ?? null;
-    const lat = Number(body?.lat);
-    const lng = Number(body?.lng);
-    if (!Number.isFinite(lat) || !Number.isFinite(lng)) return json({ error: "lat_lng_required" }, 400, corsHeaders(req));
-    if (id) {
-      await db.prepare("UPDATE caixas_emenda_cdo SET lat=?1, lng=?2, updated_at=datetime('now') WHERE id=?3").bind(lat, lng, id).run();
-      return json({ ok: true, id }, 200, corsHeaders(req));
-    } else {
-      const r = await db.prepare("INSERT INTO caixas_emenda_cdo (lat, lng) VALUES (?1, ?2)").bind(lat, lng).run();
-      return json({ ok: true, id: r.meta?.last_row_id }, 200, corsHeaders(req));
-    }
-  }
-
-  if (method === "DELETE") {
-    const id = body?.id;
-    if (!id) return json({ error: "id_required" }, 400, corsHeaders(req));
-    await db.prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1").bind(id).run();
-    return json({ ok: true, id }, 200, corsHeaders(req));
-  }
-
-  return json({ error: "method_not_allowed" }, 405, corsHeaders(req));
-}
-
-async function handleDebugDb(req, env) {
-  const { binding, db } = pickDb(env);
-  const hasToken = !!(env && env.ADMIN_TOKEN);
-  return json({
-    ok: true,
-    d1_binding: binding,
-    d1_ready: !!db,
-    admin_token_configured: hasToken,
-    note: "This endpoint is for debugging only."
-  }, 200, corsHeaders(req));
-}
+// FTTH-PWA Worker (Cloudflare Workers + D1)
+// 2026-02-27
+// Fixes in this build:
+// - /api/ctos 404 on save: implements CRUD routes (POST/PUT/PATCH/DELETE) with RBAC (admin only)
+// - Keeps GET data endpoints (CSV -> JSON) for map rendering
+// - Normalizes user roles so admin shows as admin
+// - Proxy: /api/tiles/* and /api/reverse_geocode to avoid CORS issues
 
 export default {
-  async fetch(req, env, ctx) {
-    const url = new URL(req.url);
-
-    // Preflight
-    if (req.method === "OPTIONS") {
-      return new Response(null, { status: 204, headers: corsHeaders(req) });
-    }
-
+  async fetch(request, env, ctx) {
     try {
-      if (url.pathname === "/api/debug/db") return handleDebugDb(req, env);
-      if (url.pathname === "/api/rotas") return handleRotas(req, env, url);
-      if (url.pathname === "/api/ctos") return handleCtos(req, env);
-      if (url.pathname === "/api/caixas_emenda_cdo") return handleCaixas(req, env);
+      const url = new URL(request.url);
+      let { pathname } = url;
 
-      return json({ error: "not_found" }, 404, corsHeaders(req));
-    } catch (e) {
-      return json({ error: "internal_error", message: String(e?.message || e) }, 500, corsHeaders(req));
+  // Alias: keep GET /api/rotas_fibras (GeoJSON export), but route writes to /api/rotas for backward-compat.
+  if (pathname === "/api/rotas_fibras" && request.method !== "GET") {
+    pathname = "/api/rotas";
+  }
+
+  // Alias: /api/caixas -> /api/caixas_emenda_cdo (front/backward compatibility)
+  if (pathname === "/api/caixas") {
+    pathname = "/api/caixas_emenda_cdo";
+  }
+
+// CORS preflight
+      if (request.method === "OPTIONS") return corsResponse(request, new Response(null, { status: 204 }));
+
+      // Health / root
+      if (request.method === "GET" && (pathname === "/" || pathname === "/health")) {
+        return corsJson(request, {
+          ok: true,
+          service: "ftth-pwa",
+          version: "2026-02-27-crud",
+          endpoints: [
+            "POST /api/login",
+            "GET  /api/me",
+            "POST /api/logout",
+            "GET  /api/ctos",
+            "POST /api/ctos (admin)",
+            "DELETE /api/ctos (admin)",
+            "GET  /api/caixas_emenda_cdo",
+            "POST /api/caixas_emenda_cdo (admin)",
+            "DELETE /api/caixas_emenda_cdo (admin)",
+            "GET  /api/rotas_fibras",
+            "POST /api/rotas (admin)",
+            "DELETE /api/rotas (admin)",
+            "GET  /api/movimentacoes",
+            "GET  /api/usuarios",
+            "GET  /api/log_eventos",
+            "GET  /api/reverse_geocode?lat=..&lng=..",
+            "GET  /api/tiles/{z}/{x}/{y}.png"
+          ]
+        });
+      }
+
+      // Auth
+      if (pathname === "/api/login" && request.method === "POST") return corsResponse(request, await handleLogin(request, env));
+      if (pathname === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
+      if (pathname === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
+
+      // Proxy helpers
+      if (pathname === "/api/reverse_geocode" && request.method === "GET") return corsResponse(request, await handleReverseGeocode(request));
+      if (pathname.startsWith("/api/tiles/") && request.method === "GET") return corsResponse(request, await handleTileProxy(request));
+
+      // ===== CRUD (admin only) =====
+      // NOTE: Pages currently saves to /api/ctos and expects success.
+      // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
+      if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
+      if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
+      if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
+
+      // ===== Data endpoints (auth required) =====
+      if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
+      if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
+      if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
+      if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env));
+      if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
+      if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
+
+      return corsJson(request, { error: "not_found" }, 404);
+    } catch (err) {
+      return corsJson(request, { error: "server_error", message: String(err?.stack || err) }, 500);
     }
   }
 };
+
+function isWriteMethod(m) {
+  return m === "POST" || m === "PUT" || m === "PATCH" || m === "DELETE";
+}
+
+
+function db(env) {
+  // Prefer the user-requested D1 binding name "B1"; fall back to legacy "DB" if present.
+  const d = env.B1 || env.DB;
+  if (!d) throw new Error("Missing D1 binding. Bind your database as B1 (preferred) or DB (legacy).");
+  return d;
+}
+
+// ======================= CORS helpers =======================
+function corsHeaders(request) {
+  const origin = request.headers.get("Origin") || "*";
+  return {
+    "Access-Control-Allow-Origin": origin,
+    "Access-Control-Allow-Methods": "GET,POST,PUT,PATCH,DELETE,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    "Access-Control-Allow-Credentials": "true",
+    "Vary": "Origin"
+  };
+}
+function corsResponse(request, response) {
+  const h = new Headers(response.headers);
+  const ch = corsHeaders(request);
+  for (const [k, v] of Object.entries(ch)) h.set(k, v);
+  return new Response(response.body, { status: response.status, headers: h });
+}
+function corsJson(request, obj, status = 200) {
+  return corsResponse(request, json(obj, status));
+}
+function json(obj, status = 200, headers = {}) {
+  const extra = headers?.cacheSeconds
+    ? { "Cache-Control": `public, max-age=${Number(headers.cacheSeconds) || 0}` }
+    : {};
+  return new Response(JSON.stringify(obj), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...extra }
+  });
+}
+async function readJson(request) {
+  // Header names are case-insensitive per HTTP spec; browser sometimes sends lowercase.
+  const ct = (request.headers.get("Content-Type") || request.headers.get("content-type") || "").toLowerCase();
+  if (!ct.includes("application/json")) return null;
+  return await request.json().catch(() => null);
+}
+
+// ======================= Auth / Sessions =======================
+function getBearer(request) {
+  const h = request.headers.get("Authorization") || "";
+  const m = h.match(/^Bearer\s+(.+)$/i);
+  return m ? m[1] : null;
+}
+async function sha256Hex(str) {
+  const enc = new TextEncoder().encode(str);
+  const buf = await crypto.subtle.digest("SHA-256", enc);
+  return [...new Uint8Array(buf)].map(b => b.toString(16).padStart(2, "0")).join("");
+}
+
+// PBKDF2 format stored: pbkdf2$<iter>$<salt_b64>$<hash_b64>
+async function verifyPassword(password, stored) {
+  if (!stored) return false;
+
+  if (stored.startsWith("pbkdf2$")) {
+    const parts = stored.split("$");
+    if (parts.length !== 4) return false;
+    const iter = Number(parts[1]);
+    const saltB64 = parts[2];
+    const hashB64 = parts[3];
+
+    const salt = Uint8Array.from(atob(saltB64), c => c.charCodeAt(0));
+    const expected = Uint8Array.from(atob(hashB64), c => c.charCodeAt(0));
+
+    const keyMaterial = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"]
+    );
+    const derivedBits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt, iterations: iter },
+      keyMaterial,
+      expected.length * 8
+    );
+    const got = new Uint8Array(derivedBits);
+    return timingSafeEqual(got, expected);
+  }
+
+  // legacy: raw sha256 hex (tecnico1 inserted manually)
+  if (/^[0-9a-f]{64}$/i.test(stored)) {
+    const got = await sha256Hex(password);
+    return got.toLowerCase() === stored.toLowerCase();
+  }
+
+  return false;
+}
+function timingSafeEqual(a, b) {
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
+}
+function base64Url(bytes) {
+  let s = btoa(String.fromCharCode(...bytes));
+  return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+async function mintSession(env, username) {
+  const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
+  const token = base64Url(tokenBytes);
+  const tokenHash = await sha256Hex(token);
+  const ttl = Number(env.SESSION_TTL_MS || (1000 * 60 * 60 * 24 * 7));
+  const expiresAt = new Date(Date.now() + ttl).toISOString();
+  await db(env).prepare(
+    "INSERT INTO sessions (token_hash, username, created_at, expires_at) VALUES (?1, ?2, datetime('now'), ?3)"
+  ).bind(tokenHash, username, expiresAt).run();
+  return token;
+}
+async function requireAuth(request, env) {
+  const token = getBearer(request);
+  if (!token) throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+
+  const tokenHash = await sha256Hex(token);
+  const row = await db(env).prepare(
+    "SELECT username, expires_at FROM sessions WHERE token_hash=?1"
+  ).bind(tokenHash).first();
+
+  if (!row) throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+  if (row.expires_at && Date.parse(row.expires_at) < Date.now()) {
+    await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
+    throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+  }
+  return { user: row.username, tokenHash };
+}
+function normalizeRole(role) {
+  const r = String(role || "").trim().toLowerCase();
+  if (r === "admin") return "admin";
+  return "user";
+}
+async function getUserRole(env, username) {
+  try {
+    const row = await db(env).prepare("SELECT role FROM users WHERE username=?1 AND is_active=1").bind(username).first();
+    return normalizeRole(row?.role || "user");
+  } catch (_e) {
+    return "user";
+  }
+}
+async function requireRole(request, env, allowedRoles) {
+  const auth = await requireAuth(request, env);
+  const role = await getUserRole(env, auth.user);
+  if (!allowedRoles.includes(role)) {
+    const err = new Error("forbidden");
+    err.code = "forbidden";
+    err.role = role;
+    throw err;
+  }
+  return { ...auth, role };
+}
+
+async function handleLogin(request, env) {
+  const body = await readJson(request);
+  const username = String(body?.username ?? body?.user ?? body?.login ?? "").trim();
+  const password = String(body?.password ?? body?.pass ?? "");
+  if (!username || !password) return json({ error: "missing_credentials" }, 400);
+
+  const user = await db(env).prepare(
+    "SELECT username, password_hash, is_active, role FROM users WHERE username=?1"
+  ).bind(username).first();
+
+  if (!user || !user.is_active) return json({ error: "invalid_credentials" }, 401);
+  const ok = await verifyPassword(password, user.password_hash);
+  if (!ok) return json({ error: "invalid_credentials" }, 401);
+
+  const role = normalizeRole(user.role);
+  const token = await mintSession(env, username);
+  return json({ ok: true, token, user: { username, role } });
+}
+async function handleMe(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    const role = await getUserRole(env, auth.user);
+    return json({ ok: true, user: { username: auth.user, role } });
+  } catch (_e) {
+    return json({ error: "unauthorized" }, 401);
+  }
+}
+async function handleLogout(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(auth.tokenHash).run();
+    return json({ ok: true });
+  } catch (_e) {
+    return json({ ok: true });
+  }
+}
+
+
+
+async function ensureSchema(env) {
+  // Create/patch tables as needed (best-effort). This avoids 500s when the table exists with missing columns.
+  // Rotas
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS rotas (rota_id TEXT PRIMARY KEY, nome TEXT, geojson TEXT NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // CTOs
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS ctos (cto_id TEXT PRIMARY KEY, nome TEXT, rua TEXT, bairro TEXT, capacidade INTEGER, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // CE/CDO table (existing in your D1): caixas_emenda_cdo
+  // We patch missing columns with ALTER TABLE ADD COLUMN (best-effort).
+  try {
+    await db(env).prepare(
+      "CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (id TEXT PRIMARY KEY, tipo TEXT, obs TEXT, img_url TEXT, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+    ).run();
+  } catch (_e) {}
+
+  // Patch missing columns (if table existed with partial schema)
+  const colsToEnsure = [
+    ["tipo","TEXT"], ["obs","TEXT"], ["img_url","TEXT"],
+    ["lat","REAL"], ["lng","REAL"], ["updated_at","TEXT"]
+  ];
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(caixas_emenda_cdo)").all();
+    const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
+    for (const [c,t] of colsToEnsure) {
+      if (!have.has(c)) {
+        try { await db(env).prepare(`ALTER TABLE caixas_emenda_cdo ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+
+  // Patch rotas columns if needed
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(rotas)").all();
+    const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
+    const cols = [["nome","TEXT"],["geojson","TEXT"],["updated_at","TEXT"]];
+    for (const [c,t] of cols) {
+      if (!have.has(c)) {
+        try { await db(env).prepare(`ALTER TABLE rotas ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+}
+
+async function safeLog(env, entry) {
+  // Optional: if table log_eventos exists, store logs; otherwise ignore.
+  try {
+    await db(env).prepare(
+      "INSERT INTO log_eventos (ts, user, role, action, entity, entity_id, details) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+    ).bind(entry.ts, entry.user, entry.role, entry.action, entry.entity, entry.entity_id, entry.details).run();
+  } catch (_e) { /* ignore */ }
+}
+
+// ======================= Reverse Geocode (proxy) =======================
+async function handleReverseGeocode(request) {
+  const url = new URL(request.url);
+  const lat = url.searchParams.get("lat");
+  const lng = url.searchParams.get("lng");
+  if (!lat || !lng) return json({ ok: false, error: "missing_lat_lng" }, 400);
+
+  const api = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${encodeURIComponent(lat)}&lon=${encodeURIComponent(lng)}&zoom=18&addressdetails=1`;
+  const res = await fetch(api, {
+    headers: {
+      "accept": "application/json",
+      "accept-language": "pt-BR,pt;q=0.9,en;q=0.5",
+      "user-agent": "ftth-pwa/1.0 (Cloudflare Worker)"
+    }
+  });
+  if (!res.ok) return json({ ok: false, error: "reverse_geocode_failed", status: res.status }, 502);
+
+  const data = await res.json().catch(() => null);
+  const a = data?.address || {};
+  const rua = a.road || a.pedestrian || a.footway || a.residential || "";
+  const bairro = a.suburb || a.neighbourhood || a.quarter || a.city_district || a.district || "";
+  return json({ ok: true, rua, bairro, raw: data });
+}
+
+// ======================= Tile Proxy (OSM) =======================
+async function handleTileProxy(request) {
+  const url = new URL(request.url);
+  const parts = url.pathname.split("/").filter(Boolean); // ["api","tiles","z","x","y.png"]
+  if (parts.length < 5) return json({ error: "bad_tile_path" }, 400);
+  const z = parts[2], x = parts[3];
+  let y = parts[4];
+  if (y.endsWith(".png")) y = y.slice(0, -4);
+  if (![z, x, y].every(v => /^\d+$/.test(v))) return json({ error: "bad_tile_coords" }, 400);
+
+  const tileUrl = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+
+  const cache = caches.default;
+  const cacheKey = new Request(tileUrl, { method: "GET" });
+  let resp = await cache.match(cacheKey);
+
+  if (!resp) {
+    const upstream = await fetch(tileUrl, { headers: { "user-agent": "ftth-pwa/1.0 (Cloudflare Worker)" } });
+    if (!upstream.ok) return new Response(upstream.body, { status: upstream.status, headers: upstream.headers });
+
+    resp = new Response(upstream.body, upstream);
+    resp.headers.set("Cache-Control", "public, max-age=86400");
+    try { await cache.put(cacheKey, resp.clone()); } catch (_e) {}
+  }
+
+  const h = new Headers(resp.headers);
+  h.set("Content-Type", "image/png");
+  h.set("Cache-Control", "public, max-age=86400");
+  return new Response(resp.body, { status: 200, headers: h });
+}
+
+// ======================= Apps Script submit (CRUD) =======================
+function envFirst(env, keys) {
+  for (const k of keys) {
+    const v = env[k];
+    if (v && String(v).trim()) return String(v).trim();
+  }
+  return "";
+}
+function getSubmitKey(env) {
+  return envFirst(env, ["SUBMIT_KEY", "SHEETS_SUBMIT_KEY", "FTTH_SUBMIT_KEY"]);
+}
+function getAppsScriptUrl(env) {
+  return envFirst(env, ["APPS_SCRIPT_URL", "GOOGLE_APPS_SCRIPT_URL", "SHEETS_APPS_SCRIPT_URL"]);
+}
+
+async function submitToAppsScript(env, payload) {
+  const key = getSubmitKey(env);
+  const url = getAppsScriptUrl(env);
+  if (!url) {
+    return { ok: false, error: "missing_apps_script_url", hint: "Configure APPS_SCRIPT_URL nas variáveis do Worker." };
+  }
+  if (!key) {
+    return { ok: false, error: "missing_submit_key", hint: "Configure SUBMIT_KEY (mesma chave do seu Apps Script)." };
+  }
+
+  const body = { key, ...payload };
+  const res = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+
+  const txt = await res.text();
+  let data = null;
+  try { data = JSON.parse(txt); } catch (_e) { data = { raw: txt }; }
+
+  if (!res.ok) {
+    return { ok: false, error: "apps_script_http_error", status: res.status, data };
+  }
+  return data;
+}
+
+function s(v){ return (v ?? "").toString().trim(); }
+function n(v){ const t = s(v).replace(",", "."); const num = Number(t); return Number.isFinite(num) ? num : null; }
+
+// Normalize the various shapes the Pages may send
+function extractCto(body) {
+  const src = body?.cto ?? body?.data ?? body?.payload ?? body ?? {};
+  return {
+    CTO_ID: s(src.CTO_ID ?? src.cto_id ?? src.id ?? src.ID),
+    NOME: s(src.NOME ?? src.nome ?? src.name),
+    LAT: n(src.LAT ?? src.lat ?? src.latitude),
+    LNG: n(src.LNG ?? src.lng ?? src.longitude ?? src.lon),
+    RUA: s(src.RUA ?? src.rua),
+    BAIRRO: s(src.BAIRRO ?? src.bairro),
+    CAPACIDADE: s(src.CAPACIDADE ?? src.capacidade)
+  };
+}
+function extractCaixa(body) {
+  const src = body?.caixa ?? body?.cdo ?? body?.ce_cdo ?? body?.data ?? body?.payload ?? body ?? {};
+  return {
+    ID: s(src.ID ?? src.id),
+    TIPO: s(src.TIPO ?? src.tipo),
+    LAT: n(src.LAT ?? src.lat),
+    LNG: n(src.LNG ?? src.lng ?? src.lon),
+    OBS: s(src.OBS ?? src.obs),
+    IMG_URL: s(src.IMG_URL ?? src.img_url),
+    DT_CRIACAO: s(src.DT_CRIACAO ?? src.dt_criacao),
+    DT_ATUALIZACAO: s(src.DT_ATUALIZACAO ?? src.dt_atualizacao)
+  };
+}
+function extractRota(body) {
+  // Rotas are usually an array of points for one route.
+  const src = body?.rota ?? body?.data ?? body?.payload ?? body ?? {};
+  const rota_id = s(src.ROTA_ID ?? src.rota_id ?? src.id ?? src.ID);
+  const pontos = Array.isArray(src.PONTOS) ? src.PONTOS : (Array.isArray(src.pontos) ? src.pontos : (Array.isArray(body?.pontos) ? body.pontos : []));
+  const pts = pontos.map(p => ({
+    ROTA_ID: rota_id,
+    ORDEM: Number.isFinite(Number(p.ORDEM ?? p.ordem)) ? Number(p.ORDEM ?? p.ordem) : null,
+    LAT: n(p.LAT ?? p.lat),
+    LNG: n(p.LNG ?? p.lng ?? p.lon),
+    TIPO: s(p.TIPO ?? p.tipo),
+    PESO: s(p.PESO ?? p.peso)
+  })).filter(p => p.ORDEM !== null && p.LAT !== null && p.LNG !== null);
+  return { ROTA_ID: rota_id, PONTOS: pts };
+}
+
+async function handleCrudCtos(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+        await ensureSchema(env);
+const body = await readJson(request) || {};
+    const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
+    const cto = extractCto(body);
+
+    if (!cto.CTO_ID) return json({ ok: false, error: "missing_cto_id" }, 400);
+    if (action !== "DELETE" && (cto.LAT === null || cto.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
+
+    if (action === "DELETE") {
+      await db(env).prepare("DELETE FROM ctos WHERE cto_id=?1").bind(cto.CTO_ID).run();
+    } else {
+      const upd = await db(env).prepare(
+        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8 WHERE cto_id=?1"
+      ).bind(
+        cto.CTO_ID,
+        s(cto.NOME),
+        s(cto.RUA),
+        s(cto.BAIRRO),
+        intOrNull(cto.CAPACIDADE),
+        num(cto.LAT),
+        num(cto.LNG),
+        new Date().toISOString()
+      ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO ctos (cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
+        ).bind(
+          cto.CTO_ID,
+          s(cto.NOME),
+          s(cto.RUA),
+          s(cto.BAIRRO),
+          intOrNull(cto.CAPACIDADE),
+          num(cto.LAT),
+          num(cto.LNG),
+          new Date().toISOString()
+        ).run();
+      }
+    }
+
+    // log
+    await safeLog(env, {
+      ts: new Date().toISOString(),
+      user: auth.user,
+      role: auth.role,
+      action: `${action}_CTO`,
+      entity: "CTO",
+      entity_id: cto.CTO_ID,
+      details: JSON.stringify(cto)
+    });
+
+    return json({ ok: true });
+  } catch (e) {
+    if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
+    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    return json({ ok: false, error: "cto_crud_failed", message: String(e?.stack || e), hint: "Verifique colunas da tabela ctos (cto_id/nome/rua/bairro/capacidade/lat/lng). Se sua tabela usa outros nomes, avise que eu ajusto." }, 500);
+  // cto_crud_fallback
+  }
+}
+
+async function handleCrudCaixas(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+        await ensureSchema(env);
+const body = await readJson(request) || {};
+    const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
+    const cx = extractCaixa(body);
+
+    if (!cx.ID) return json({ ok: false, error: "missing_id" }, 400);
+    if (action !== "DELETE" && (cx.LAT === null || cx.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
+
+    if (action === "DELETE") {
+      await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1").bind(cx.ID).run();
+    } else {
+      // Update first (works even if no UNIQUE constraint; if none matched, insert)
+      const upd = await db(env).prepare(
+        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7 WHERE id=?1"
+      ).bind(
+        cx.ID,
+        s(cx.TIPO),
+        s(cx.OBS),
+        s(cx.IMG_URL),
+        num(cx.LAT),
+        num(cx.LNG),
+        new Date().toISOString()
+      ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO caixas_emenda_cdo (id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+        ).bind(
+          cx.ID,
+          s(cx.TIPO),
+          s(cx.OBS),
+          s(cx.IMG_URL),
+          num(cx.LAT),
+          num(cx.LNG),
+          new Date().toISOString()
+        ).run();
+      }
+    }
+
+    await safeLog(env, {
+      ts: new Date().toISOString(),
+      user: auth.user,
+      role: auth.role,
+      action: `${action}_CAIXA`,
+      entity: "CE/CDO",
+      entity_id: cx.ID,
+      details: JSON.stringify(cx)
+    });
+
+    return json({ ok: true });
+  } catch (e) {
+    if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
+    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    return json({ ok: false, error: "caixa_crud_failed", message: String(e?.stack || e) }, 500);
+  }
+}
+
+async function handleCrudRotas(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+        await ensureSchema(env);
+const body = await readJson(request) || {};
+    const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
+
+    const rota_id = s(body.rota_id || body.ROTA_ID || body.id || body.ID);
+    const nome = s(body.nome || body.NOME);
+    let geojsonRaw = body.geojson ?? body.GEOJSON ?? body.data ?? body.feature ?? body.features;
+
+    if (!rota_id) return json({ ok: false, error: "missing_rota_id" }, 400);
+
+    if (action === "DELETE") {
+      await db(env).prepare("DELETE FROM rotas WHERE rota_id=?1").bind(rota_id).run();
+    } else {
+      if (!geojsonRaw) return json({ ok: false, error: "missing_geojson", message: "O campo geojson é obrigatório para salvar uma rota." }, 400);
+      if (typeof geojsonRaw === "string") {
+        try { geojsonRaw = JSON.parse(geojsonRaw); } catch (_e) { /* keep as string */ }
+      }
+      // normalize to string
+      const geojsonText = (typeof geojsonRaw === "string") ? geojsonRaw : JSON.stringify(geojsonRaw || {});
+      const upd = await db(env).prepare(
+        "UPDATE rotas SET nome=?2, geojson=?3, updated_at=?4 WHERE rota_id=?1"
+      ).bind(
+        rota_id,
+        nome,
+        geojsonText,
+        new Date().toISOString()
+      ).run();
+
+      if (!upd || !upd.meta || upd.meta.changes === 0) {
+        await db(env).prepare(
+          "INSERT INTO rotas (rota_id, nome, geojson, updated_at) VALUES (?1,?2,?3,?4)"
+        ).bind(
+          rota_id,
+          nome,
+          geojsonText,
+          new Date().toISOString()
+        ).run();
+      }
+    }
+
+    await safeLog(env, {
+      ts: new Date().toISOString(),
+      user: auth.user,
+      role: auth.role,
+      action: `${action}_ROTA`,
+      entity: "ROTA",
+      entity_id: rota_id,
+      details: JSON.stringify({ rota_id, nome })
+    });
+
+    return json({ ok: true });
+  } catch (e) {
+    if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
+    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    return json({ ok: false, error: "rota_crud_failed", message: String(e?.stack || e) }, 500);
+  }
+}
+
+// ======================= CSV Helpers (Sheets published as CSV) =======================
+function getCsvUrl(env, logicalName) {
+  // Compatibility: accept older variable names too.
+  const map = {
+    CTOS: ["SHEETS_CTOS_CSV_URL", "SHEETS_CTOS_URL", "SHEETS_CTOS_CSV", "SHEETS_CTO_CSV_URL", "SHEETS_CTO_URL"],
+    CAIXAS: ["SHEETS_CAIXAS_EMENDA_CDO_CSV_URL", "SHEETS_CAIXAS_EMENDA_CDO_URL", "SHEETS_CAIXAS_CSV_URL", "SHEETS_CE_CDO_CSV_URL", "SHEETS_CE_CDO_URL"],
+    ROTAS: ["SHEETS_ROTAS_FIBRAS_CSV_URL", "SHEETS_ROTAS_FIBRAS_URL", "SHEETS_ROTAS_CSV_URL", "SHEETS_ROTAS_URL"],
+    MOV: ["SHEETS_MOVIMENTACOES_CSV_URL", "SHEETS_MOVIMENTACOES_URL", "SHEETS_MOV_CSV_URL", "SHEETS_MOV_URL"],
+    USERS: ["SHEETS_USUARIOS_CSV_URL", "SHEETS_USUARIOS_URL", "SHEETS_USERS_CSV_URL", "SHEETS_USERS_URL"],
+    LOG: ["SHEETS_LOG_EVENTOS_CSV_URL", "SHEETS_LOG_EVENTOS_URL", "SHEETS_LOG_CSV_URL", "SHEETS_LOG_URL"]
+  };
+  return envFirst(env, map[logicalName] || []);
+}
+
+async function fetchCSV(csvUrl) {
+  if (!csvUrl) {
+    const err = new Error("missing_csv_url");
+    err.code = "missing_csv_url";
+    throw err;
+  }
+  const res = await fetch(csvUrl, { cf: { cacheTtl: 60, cacheEverything: true }, headers: { "user-agent": "ftth-pwa-worker" } });
+  if (!res.ok) {
+    const err = new Error(`csv_fetch_failed:${res.status}`);
+    err.code = "csv_fetch_failed";
+    err.status = res.status;
+    throw err;
+  }
+  return parseCSV(await res.text());
+}
+function parseCSV(text) {
+  const lines = String(text || "").split(/\r?\n/).map(l => l.trimEnd()).filter(l => l.length > 0);
+  if (!lines.length) return [];
+  const header = splitCSVLine(lines[0]).map(h => h.trim());
+  const out = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cols = splitCSVLine(lines[i]);
+    const obj = {};
+    for (let c = 0; c < header.length; c++) obj[header[c]] = (cols[c] ?? "");
+    out.push(obj);
+  }
+  return out;
+}
+function splitCSVLine(line) {
+  const res = [];
+  let cur = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') { cur += '"'; i++; }
+      else inQuotes = !inQuotes;
+      continue;
+    }
+    if (ch === "," && !inQuotes) { res.push(cur); cur = ""; continue; }
+    cur += ch;
+  }
+  res.push(cur);
+  return res;
+}
+function num(v) { const t = s(v).replace(",", "."); return Number(t); }
+function finite(n) { return Number.isFinite(n); }
+function intOrNull(v) { const t = s(v); if (!t) return null; const n = parseInt(t, 10); return Number.isFinite(n) ? n : null; }
+function numOrNull(v) { const nn = num(v); return Number.isFinite(nn) ? nn : null; }
+function bool(v) { const t = s(v).toLowerCase(); return t === "1" || t === "true" || t === "yes" || t === "y" || t === "sim"; }
+function uniq(arr) { const set = new Set(); for (const x of arr) if (x != null && String(x).trim() !== "") set.add(String(x)); return Array.from(set); }
+function avg(nums) { if (!nums.length) return null; const ss = nums.reduce((a, b) => a + b, 0); return ss / nums.length; }
+
+async function requireViewer(request, env) {
+  return await requireAuth(request, env);
+}
+
+// ======================= GET: CTOs / Caixas / Rotas =======================
+async function handleGetCtos(request, env) {
+  try {
+    await requireViewer(request, env);
+    await ensureSchema(env);
+
+    const rows = await db(env).prepare(
+      "SELECT * FROM ctos ORDER BY cto_id"
+    ).all();
+
+    const items = (rows?.results || []).map(r => {
+      const cto_id = s(r.cto_id || r.CTO_ID || r.id || r.ID || r.codigo || r.code);
+      const nome = s(r.nome || r.NOME || r.name);
+      const rua = s(r.rua || r.RUA);
+      const bairro = s(r.bairro || r.BAIRRO);
+      const capacidade = intOrNull(r.capacidade ?? r.CAPACIDADE);
+      const lat = num(r.lat ?? r.LAT ?? r.latitude ?? r.Latitude);
+      const lng = num(r.lng ?? r.LNG ?? r.longitude ?? r.Longitude);
+      return {
+        CTO_ID: cto_id,
+        cto_id,
+        NOME: nome,
+        nome,
+        RUA: rua,
+        rua,
+        BAIRRO: bairro,
+        bairro,
+        CAPACIDADE: capacidade,
+        capacidade,
+        LAT: lat,
+        LNG: lng,
+        lat,
+        lng,
+        updated_at: s(r.updated_at || r.updatedAt || r.atualizado_em || r.ts),
+        created_at: s(r.created_at || r.createdAt)
+      };
+    }).filter(x => finite(x.lat) && finite(x.lng));
+
+    // If some rows lack id, synthesize stable ids from rowid
+    for (let i=0;i<items.length;i++){
+      if (!items[i].cto_id){
+        const row = (rows?.results || [])[i];
+        const rid = row && (row.rowid || row.ROWID);
+        const sid = rid ? `CTO-${rid}` : `CTO-${i+1}`;
+        items[i].cto_id = sid;
+        items[i].CTO_ID = sid;
+      }
+    }
+
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 5 });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes("no such table") || msg.includes("no such column")) {
+      return json({ ok: false, error: "d1_schema_missing", message: msg }, 500);
+    }
+    return json({ ok: false, error: "ctos_failed", message: msg }, 500);
+  }
+}
+
+async function handleGetCaixas(request, env) {
+  try {
+    await requireViewer(request, env);
+
+        await ensureSchema(env);
+const rows = await db(env).prepare(
+      "SELECT * FROM caixas_emenda_cdo ORDER BY id"
+    ).all();
+
+    const items = (rows?.results || []).map(r => {
+      const id = s(r.id || r.caixa_id || r.ID || r.codigo || r.code);
+      const tipo = s(r.tipo || r.TIPO || r.type);
+      const obs = s(r.obs || r.OBS || r.observacao || r.observações || r.observacao_txt);
+      const img_url = s(r.img_url || r.IMG_URL || r.foto || r.url || r.image);
+      const lat = num(r.lat ?? r.latitude ?? r.LAT ?? r.Latitude);
+      const lng = num(r.lng ?? r.longitude ?? r.LNG ?? r.Longitude);
+      return {
+        ID: id, id,
+        TIPO: tipo, tipo,
+        OBS: obs, obs,
+        IMG_URL: img_url, img_url,
+        LAT: lat, LNG: lng, lat, lng,
+        updated_at: s(r.updated_at || r.updatedAt || r.atualizado_em || r.ts)
+      };
+    }).filter(x => x.id && finite(x.lat) && finite(x.lng));
+
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 5 });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    if (msg.includes("no such table") || msg.includes("no such column")) {
+      return json({ ok: false, error: "d1_schema_missing", message: msg }, 500);
+    }
+    return json({ ok: false, error: "caixas_failed", message: msg }, 500);
+  }
+}
+
+async function handleGetRotas(request, env) {
+  try {
+    await requireViewer(request, env);
+    await ensureSchema(env);
+
+    const url = new URL(request.url);
+    const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "").trim();
+
+    // Schema-flexible read
+    const rows = await db(env).prepare("SELECT * FROM rotas").all();
+
+    const items = [];
+    const features = [];
+
+    const pick = (r, keys) => {
+      for (const k of keys) {
+        if (r && Object.prototype.hasOwnProperty.call(r, k) && r[k] !== undefined && r[k] !== null) return r[k];
+      }
+      return undefined;
+    };
+
+    for (const r of (rows?.results || [])) {
+      const rota_id = s(pick(r, ["rota_id","ROTA_ID","id","ID","codigo","CODE"]));
+      if (rotaIdFilter && rota_id !== rotaIdFilter) continue;
+
+      const nome = s(pick(r, ["nome","NOME","name"]));
+      const updated_at = s(pick(r, ["updated_at","UPDATED_AT","updatedAt","atualizado_em","ts"]));
+
+      items.push({ rota_id, nome, updated_at });
+
+      const raw = pick(r, ["geojson","GEOJSON","data","DATA","geom","GEOM","geometry","GEOMETRY","json","JSON"]);
+      if (!raw) continue;
+
+      let gj = null;
+      try {
+        gj = (typeof raw === "string") ? JSON.parse(raw) : raw;
+      } catch (_e) { continue; }
+
+      const attachProps = (f) => {
+        if (!f || f.type !== "Feature") return null;
+        const p = (f.properties && typeof f.properties === "object") ? f.properties : {};
+        return { ...f, properties: { ...p, rota_id, nome } };
+      };
+
+      if (gj.type === "FeatureCollection" && Array.isArray(gj.features)) {
+        for (const f of gj.features) {
+          const ff = attachProps(f);
+          if (ff) features.push(ff);
+        }
+      } else if (gj.type === "Feature") {
+        const ff = attachProps(gj);
+        if (ff) features.push(ff);
+      } else if (gj.type === "LineString") {
+        // If stored as bare geometry
+        features.push(attachProps({ type:"Feature", properties:{}, geometry: gj }));
+      }
+    }
+
+    const geojson = { type: "FeatureCollection", features };
+    return json({ ok: true, geojson, items, data: geojson }, 200, { cacheSeconds: 5 });
+  } catch (e) {
+    const msg = String(e?.message || e);
+    return json({ ok: false, error: "rotas_failed", message: msg }, 500);
+  }
+}
+
+async function handleGetMovimentacoes(request, env) {
+  try {
+    await requireViewer(request, env);
+    const csvUrl = getCsvUrl(env, "MOV");
+    const rows = await fetchCSV(csvUrl);
+    const items = rows.map(r => ({
+      DATA: s(r.DATA || r.data),
+      CTO_ID: s(r.CTO_ID || r.cto_id),
+      Tipo: s(r.Tipo ?? r.TIPO ?? r.tipo),
+      Cliente: s(r.Cliente ?? r.CLIENTE ?? r.cliente),
+      Usuario: s(r.Usuario ?? r.USUARIO ?? r.usuario),
+      Observacao: s(r.Observacao ?? r.OBSERVACAO ?? r.observacao)
+    }));
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 30 });
+  } catch (e) {
+    return json({ ok: false, error: "mov_failed", message: String(e?.message || e) }, 500);
+  }
+}
+
+async function handleGetUsuarios(request, env) {
+  try {
+    await requireViewer(request, env);
+    const csvUrl = getCsvUrl(env, "USERS");
+    const rows = await fetchCSV(csvUrl);
+    const items = rows.map(r => ({
+      USER: s(r.USER || r.user || r.username),
+      ROLE: normalizeRole(r.ROLE || r.role),
+      ACTIVE: bool(r.ACTIVE || r.active),
+      CREATED_AT: s(r.CREATED_AT || r.created_at),
+      MUST_CHANGE: bool(r.MUST_CHANGE || r.must_change),
+      UPDATED_AT: s(r.UPDATED_AT || r.updated_at),
+      LAST_LOGIN: s(r.LAST_LOGIN || r.last_login)
+    })).filter(x => x.USER);
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 30 });
+  } catch (e) {
+    return json({ ok: false, error: "users_failed", message: String(e?.message || e) }, 500);
+  }
+}
+
+async function handleGetLogEventos(request, env) {
+  try {
+    await requireViewer(request, env);
+    const csvUrl = getCsvUrl(env, "LOG");
+    const rows = await fetchCSV(csvUrl);
+
+    const items = rows.map(r => ({
+      TS: s(r.TS || r.ts),
+      USER: s(r.USER || r.user),
+      ROLE: normalizeRole(r.ROLE || r.role),
+      ACTION: s(r.ACTION || r.action),
+      ENTITY: s(r.ENTITY || r.entity),
+      ENTITY_ID: s(r.ENTITY_ID || r.entity_id),
+      DETAILS: s(r.DETAILS || r.details)
+    })).filter(x => x.TS);
+
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 15 });
+  } catch (e) {
+    return json({ ok: false, error: "log_failed", message: String(e?.message || e) }, 500);
+  }
+}
