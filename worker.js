@@ -554,7 +554,10 @@ const body = await readJson(request) || {};
     return json({ ok: true });
   } catch (e) {
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
-    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    if (e?.code === "unauthorized") {
+      const _pick = (typeof pickDb==="function") ? pickDb(env) : { name: null };
+      return json({ ok:false, error:"unauthorized", dbBinding:_pick.name||"unknown", hint:"Token ausente/inválido ou sessão não encontrada no D1. Refaça login e confirme o binding do D1 no Worker." }, 401);
+    }
     return json({ ok: false, error: "cto_crud_failed", message: String(e?.stack || e), hint: "Verifique colunas da tabela ctos (cto_id/nome/rua/bairro/capacidade/lat/lng). Se sua tabela usa outros nomes, avise que eu ajusto." }, 500);
   // cto_crud_fallback
   }
@@ -615,7 +618,10 @@ const body = await readJson(request) || {};
     return json({ ok: true });
   } catch (e) {
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
-    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    if (e?.code === "unauthorized") {
+      const _pick = (typeof pickDb==="function") ? pickDb(env) : { name: null };
+      return json({ ok:false, error:"unauthorized", dbBinding:_pick.name||"unknown", hint:"Token ausente/inválido ou sessão não encontrada no D1. Refaça login e confirme o binding do D1 no Worker." }, 401);
+    }
     return json({ ok: false, error: "caixa_crud_failed", message: String(e?.stack || e) }, 500);
   }
 }
@@ -675,7 +681,10 @@ const body = await readJson(request) || {};
     return json({ ok: true });
   } catch (e) {
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
-    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    if (e?.code === "unauthorized") {
+      const _pick = (typeof pickDb==="function") ? pickDb(env) : { name: null };
+      return json({ ok:false, error:"unauthorized", dbBinding:_pick.name||"unknown", hint:"Token ausente/inválido ou sessão não encontrada no D1. Refaça login e confirme o binding do D1 no Worker." }, 401);
+    }
     return json({ ok: false, error: "rota_crud_failed", message: String(e?.stack || e) }, 500);
   }
 }
