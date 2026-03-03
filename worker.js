@@ -53,6 +53,12 @@ export default {
         });
       }
 
+      // Debug (no auth)
+      if (pathname === "/api/debug/db" && request.method === "GET") {
+        const p = pickDb(env);
+        return corsJson(request, { ok:true, binding: p.name, hasDb: !!p.db, envKeys: Object.keys(env).sort() });
+      }
+
       // Auth
       if (pathname === "/api/login" && request.method === "POST") return corsResponse(request, await handleLogin(request, env));
       if (pathname === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
@@ -113,8 +119,11 @@ function corsJson(request, obj, status = 200) {
   return corsResponse(request, json(obj, status));
 }
 function pickDb(env){
-  if (env.DB) return { db: env.DB, name: "DB" };
+  // IMPORTANT: this project uses the Cloudflare D1 binding named **B1**.
+  // Keep B1 as the highest priority to avoid accidentally writing sessions/rotas
+  // into an older/unused binding (e.g. DB).
   if (env.B1) return { db: env.B1, name: "B1" };
+  if (env.DB) return { db: env.DB, name: "DB" };
   if (env.D1) return { db: env.D1, name: "D1" };
   if (env.FTTH_DB) return { db: env.FTTH_DB, name: "FTTH_DB" };
   for (const k of Object.keys(env)){
