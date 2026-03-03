@@ -73,7 +73,6 @@ export default {
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
       if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
-      if (pathname === "/api/rotas" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
       if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env));
       if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
@@ -91,9 +90,16 @@ function isWriteMethod(m) {
 
 
 function db(env) {
-  // Prefer the user-requested D1 binding name "B1"; fall back to legacy "DB" if present.
-  const d = env.B1 || env.DB;
-  if (!d) throw new Error("Missing D1 binding. Bind your database as B1 (preferred) or DB (legacy).");
+  // Be tolerant with binding names across deployments.
+  // Priority: existing legacy DB (most likely), then B1, then any other common names.
+  const d =
+    env.DB ||
+    env.B1 ||
+    env.FTTH_DB ||
+    env.ftth_db ||
+    env.D1 ||
+    env.database;
+  if (!d) throw new Error("Missing D1 binding. Bind your database as DB or B1 (or FTTH_DB).");
   return d;
 }
 
