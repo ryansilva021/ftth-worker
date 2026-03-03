@@ -42,7 +42,6 @@ export default {
             "POST /api/caixas_emenda_cdo (admin)",
             "DELETE /api/caixas_emenda_cdo (admin)",
             "GET  /api/rotas_fibras",
-            "GET  /api/rotas",
             "POST /api/rotas (admin)",
             "DELETE /api/rotas (admin)",
             "GET  /api/movimentacoes",
