@@ -149,9 +149,12 @@ function getToken(request) {
   const m = auth.match(/^Bearer\s+(.+)$/i);
   if (m) return m[1];
 
-  // 2) X-Auth-Token header (frontend-friendly)
+  // 2) X-Auth-Token / X-FTTH-Token header (frontend-friendly)
   const x = request.headers.get("X-Auth-Token") || request.headers.get("x-auth-token");
   if (x) return x;
+
+  const xf = request.headers.get("X-FTTH-Token") || request.headers.get("x-ftth-token");
+  if (xf) return xf;
 
   // 3) Cookie: token=<token> OR session=<token>
   const cookie = request.headers.get("Cookie") || "";
@@ -159,6 +162,13 @@ function getToken(request) {
   if (mc) return decodeURIComponent(mc[2]);
 
   return null;
+}
+
+function isAdminToken(token, env) {
+  if (!token) return false;
+  const want = (env && (env.ADMIN_TOKEN || env.FTTH_TOKEN || env.API_TOKEN || env.TOKEN)) || null;
+  if (!want) return false;
+  return token === want;
 }
 async function sha256Hex(str) {
   const enc = new TextEncoder().encode(str);
@@ -255,6 +265,18 @@ async function getUserRole(env, username) {
   }
 }
 async function requireRole(request, env, allowedRoles) {
+  // Token-based admin auth (avoids 3rd-party cookie issues when calling workers.dev)
+  const t = getToken(request);
+  if (isAdminToken(t, env)) {
+    if (!allowedRoles.includes("admin")) {
+      const err = new Error("forbidden");
+      err.code = "forbidden";
+      err.role = "admin";
+      throw err;
+    }
+    return { user: "admin", role: "admin", via: "token" };
+  }
+
   const auth = await requireAuth(request, env);
   const role = await getUserRole(env, auth.user);
   if (!allowedRoles.includes(role)) {
