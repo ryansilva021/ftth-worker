@@ -1469,8 +1469,7 @@ async function handleExportMovimentacoes(request, env) {
       csvEsc(r.Cliente), csvEsc(r.Usuario), csvEsc(r.Observacao), csvEsc(r.created_at)
     ].join(","));
 
-    const csv = [header, ...lines].join("
-");
+    const csv = [header, ...lines].join("\r\n");
     return new Response(csv, {
       headers: {
         "Content-Type": "text/csv; charset=utf-8",
@@ -1486,8 +1485,7 @@ async function handleExportMovimentacoes(request, env) {
 }
 function csvEsc(v) {
   const s2 = String(v ?? "");
-  return s2.includes(",") || s2.includes('"') || s2.includes("
-")
+  return s2.includes(",") || s2.includes('"') || s2.includes("\n")
     ? '"' + s2.replace(/"/g, '""') + '"'
     : s2;
 }
