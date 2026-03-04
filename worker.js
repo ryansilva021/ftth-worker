@@ -69,6 +69,13 @@ export default {
       if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
       if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
 
+      // ===== Gerenciamento de usuários (admin) =====
+      if (pathname === "/api/users" && request.method === "GET")    return corsResponse(request, await handleListUsers(request, env));
+      if (pathname === "/api/users" && request.method === "POST")   return corsResponse(request, await handleUpsertUser(request, env));
+      if (pathname === "/api/users" && request.method === "DELETE") return corsResponse(request, await handleDeleteUser(request, env));
+      if (pathname === "/api/users/set-password" && request.method === "POST") return corsResponse(request, await handleSetPassword(request, env));
+      if (pathname === "/api/users/toggle-active" && request.method === "POST") return corsResponse(request, await handleToggleActive(request, env));
+
       // ===== Data endpoints (auth required) =====
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
@@ -333,6 +340,215 @@ async function ensureSchema(env) {
       }
     }
   } catch (_e) {}
+
+  // Tabela users — cria se não existir, garante colunas mínimas
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS users (
+        username      TEXT PRIMARY KEY,
+        password_hash TEXT NOT NULL,
+        role          TEXT NOT NULL DEFAULT 'user',
+        is_active     INTEGER NOT NULL DEFAULT 1,
+        created_at    TEXT,
+        updated_at    TEXT
+      )
+    `).run();
+  } catch (_e) {}
+
+  // Garante colunas que podem faltar em tabelas antigas
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(users)").all();
+    const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
+    const userCols = [
+      ["role","TEXT NOT NULL DEFAULT 'user'"],
+      ["is_active","INTEGER NOT NULL DEFAULT 1"],
+      ["created_at","TEXT"],
+      ["updated_at","TEXT"]
+    ];
+    for (const [c,t] of userCols) {
+      if (!have.has(c)) {
+        try { await db(env).prepare(`ALTER TABLE users ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      }
+    }
+  } catch (_e) {}
+
+  // Tabela sessions — cria se não existir
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        username   TEXT NOT NULL,
+        created_at TEXT,
+        expires_at TEXT
+      )
+    `).run();
+  } catch (_e) {}
+}
+
+// ======================= Helpers de senha =======================
+
+// Gera hash PBKDF2 no formato armazenado: pbkdf2$<iter>$<salt_b64>$<hash_b64>
+async function hashPassword(password) {
+  const iter = 100000;
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const keyMaterial = await crypto.subtle.importKey(
+    "raw", new TextEncoder().encode(password), "PBKDF2", false, ["deriveBits"]
+  );
+  const bits = await crypto.subtle.deriveBits(
+    { name: "PBKDF2", hash: "SHA-256", salt, iterations: iter },
+    keyMaterial, 256
+  );
+  const saltB64 = btoa(String.fromCharCode(...salt));
+  const hashB64 = btoa(String.fromCharCode(...new Uint8Array(bits)));
+  return `pbkdf2$${iter}$${saltB64}$${hashB64}`;
+}
+
+// ======================= Handlers de usuários =======================
+
+// GET /api/users — lista todos os usuários (admin)
+async function handleListUsers(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const res = await db(env).prepare(
+      "SELECT username, role, is_active, created_at, updated_at FROM users ORDER BY username"
+    ).all();
+    const items = (res?.results || []).map(u => ({
+      username:   u.username,
+      role:       u.role || "user",
+      is_active:  u.is_active === 1 || u.is_active === true,
+      created_at: u.created_at || "",
+      updated_at: u.updated_at || ""
+    }));
+    return json({ ok: true, items });
+  } catch (e) {
+    if (e.code === "forbidden") return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/users — cria ou atualiza usuário { username, password, role }
+async function handleUpsertUser(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const username = String(body?.username || "").trim().toLowerCase();
+    const password = String(body?.password || "");
+    const role     = String(body?.role || "user").trim().toLowerCase();
+    const active   = body?.is_active !== false ? 1 : 0;
+
+    if (!username) return json({ error: "username_required" }, 400);
+    if (!password) return json({ error: "password_required" }, 400);
+    if (username.length < 2) return json({ error: "username_too_short" }, 400);
+    if (password.length < 4) return json({ error: "password_too_short" }, 400);
+
+    const validRoles = ["admin", "user", "tecnico", "viewer"];
+    const finalRole = validRoles.includes(role) ? role : "user";
+
+    const hash = await hashPassword(password);
+    const now  = new Date().toISOString();
+
+    // UPSERT: atualiza se existe, insere se não existe
+    const existing = await db(env).prepare(
+      "SELECT username FROM users WHERE username=?1"
+    ).bind(username).first();
+
+    if (existing) {
+      await db(env).prepare(
+        "UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4 WHERE username=?5"
+      ).bind(hash, finalRole, active, now, username).run();
+    } else {
+      await db(env).prepare(
+        "INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?5)"
+      ).bind(username, hash, finalRole, active, now).run();
+    }
+
+    return json({ ok: true, username, role: finalRole, is_active: active === 1, action: existing ? "updated" : "created" });
+  } catch (e) {
+    if (e.code === "forbidden")     return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized")  return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// DELETE /api/users — remove usuário { username }
+async function handleDeleteUser(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const username = String(body?.username || "").trim().toLowerCase();
+    if (!username) return json({ error: "username_required" }, 400);
+
+    // Impede remover o próprio usuário
+    const auth = await requireAuth(request, env);
+    if (auth.user === username) return json({ error: "cannot_delete_self" }, 400);
+
+    await db(env).prepare("DELETE FROM users WHERE username=?1").bind(username).run();
+    await db(env).prepare("DELETE FROM sessions WHERE username=?1").bind(username).run();
+    return json({ ok: true, username, action: "deleted" });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/users/set-password — troca senha { username, password }
+async function handleSetPassword(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const username = String(body?.username || "").trim().toLowerCase();
+    const password = String(body?.password || "");
+    if (!username) return json({ error: "username_required" }, 400);
+    if (password.length < 4) return json({ error: "password_too_short" }, 400);
+
+    const hash = await hashPassword(password);
+    const now  = new Date().toISOString();
+    await db(env).prepare(
+      "UPDATE users SET password_hash=?1, updated_at=?2 WHERE username=?3"
+    ).bind(hash, now, username).run();
+    // Invalida sessões antigas
+    await db(env).prepare("DELETE FROM sessions WHERE username=?1").bind(username).run();
+    return json({ ok: true, username, action: "password_updated" });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/users/toggle-active — ativa/desativa { username, is_active }
+async function handleToggleActive(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body     = await readJson(request);
+    const username = String(body?.username || "").trim().toLowerCase();
+    const active   = body?.is_active ? 1 : 0;
+    if (!username) return json({ error: "username_required" }, 400);
+
+    const auth = await requireAuth(request, env);
+    if (!active && auth.user === username) return json({ error: "cannot_deactivate_self" }, 400);
+
+    const now = new Date().toISOString();
+    await db(env).prepare(
+      "UPDATE users SET is_active=?1, updated_at=?2 WHERE username=?3"
+    ).bind(active, now, username).run();
+    if (!active) {
+      // Invalida sessões ao desativar
+      await db(env).prepare("DELETE FROM sessions WHERE username=?1").bind(username).run();
+    }
+    return json({ ok: true, username, is_active: active === 1 });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
 }
 
 async function safeLog(env, entry) {
