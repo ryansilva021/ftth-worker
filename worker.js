@@ -69,6 +69,12 @@ export default {
       if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
       if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
 
+      // ===== Gerenciamento de projetos (superadmin) =====
+      if (pathname === "/api/projetos" && request.method === "GET")    return corsResponse(request, await handleListProjetos(request, env));
+      if (pathname === "/api/projetos" && request.method === "POST")   return corsResponse(request, await handleUpsertProjeto(request, env));
+      if (pathname === "/api/projetos" && request.method === "DELETE") return corsResponse(request, await handleDeleteProjeto(request, env));
+      if (pathname === "/api/projetos/stats" && request.method === "GET") return corsResponse(request, await handleProjetoStats(request, env));
+
       // ===== Gerenciamento de usuários (admin) =====
       if (pathname === "/api/users" && request.method === "GET")    return corsResponse(request, await handleListUsers(request, env));
       if (pathname === "/api/users" && request.method === "POST")   return corsResponse(request, await handleUpsertUser(request, env));
@@ -203,15 +209,16 @@ function base64Url(bytes) {
   let s = btoa(String.fromCharCode(...bytes));
   return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
-async function mintSession(env, username) {
+async function mintSession(env, username, projeto_id) {
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
-  const token = base64Url(tokenBytes);
-  const tokenHash = await sha256Hex(token);
-  const ttl = Number(env.SESSION_TTL_MS || (1000 * 60 * 60 * 24 * 7));
-  const expiresAt = new Date(Date.now() + ttl).toISOString();
+  const token      = base64Url(tokenBytes);
+  const tokenHash  = await sha256Hex(token);
+  const ttl        = Number(env.SESSION_TTL_MS || (1000 * 60 * 60 * 24 * 7));
+  const expiresAt  = new Date(Date.now() + ttl).toISOString();
+  const pid        = projeto_id || "default";
   await db(env).prepare(
-    "INSERT INTO sessions (token_hash, username, created_at, expires_at) VALUES (?1, ?2, datetime('now'), ?3)"
-  ).bind(tokenHash, username, expiresAt).run();
+    "INSERT INTO sessions (token_hash, username, projeto_id, created_at, expires_at) VALUES (?1, ?2, ?3, datetime('now'), ?4)"
+  ).bind(tokenHash, username, pid, expiresAt).run();
   return token;
 }
 async function requireAuth(request, env) {
@@ -220,7 +227,7 @@ async function requireAuth(request, env) {
 
   const tokenHash = await sha256Hex(token);
   const row = await db(env).prepare(
-    "SELECT username, expires_at FROM sessions WHERE token_hash=?1"
+    "SELECT username, projeto_id, expires_at FROM sessions WHERE token_hash=?1"
   ).bind(tokenHash).first();
 
   if (!row) throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
@@ -228,56 +235,87 @@ async function requireAuth(request, env) {
     await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
     throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
   }
-  return { user: row.username, tokenHash };
+  return { user: row.username, tokenHash, projeto_id: row.projeto_id || "default" };
 }
 function normalizeRole(role) {
   const r = String(role || "").trim().toLowerCase();
-  if (r === "admin") return "admin";
+  if (r === "superadmin") return "superadmin";
+  if (r === "admin")      return "admin";
+  if (r === "tecnico")    return "tecnico";
   return "user";
 }
-async function getUserRole(env, username) {
+async function getUserFull(env, username) {
   try {
-    const row = await db(env).prepare("SELECT role FROM users WHERE username=?1 AND is_active=1").bind(username).first();
-    return normalizeRole(row?.role || "user");
+    const row = await db(env).prepare(
+      "SELECT role, projeto_id FROM users WHERE username=?1 AND is_active=1"
+    ).bind(username).first();
+    return {
+      role:       normalizeRole(row?.role || "user"),
+      projeto_id: row?.projeto_id || "default"
+    };
   } catch (_e) {
-    return "user";
+    return { role: "user", projeto_id: "default" };
   }
+}
+async function getUserRole(env, username) {
+  return (await getUserFull(env, username)).role;
 }
 async function requireRole(request, env, allowedRoles) {
   const auth = await requireAuth(request, env);
-  const role = await getUserRole(env, auth.user);
-  if (!allowedRoles.includes(role)) {
+  const full = await getUserFull(env, auth.user);
+  // superadmin tem acesso a tudo
+  const effective = full.role === "superadmin" && !allowedRoles.includes("superadmin")
+    ? [...allowedRoles, "superadmin"] : allowedRoles;
+  if (!effective.includes(full.role)) {
     const err = new Error("forbidden");
-    err.code = "forbidden";
-    err.role = role;
+    err.code  = "forbidden";
+    err.role  = full.role;
     throw err;
   }
-  return { ...auth, role };
+  return { ...auth, role: full.role, projeto_id: auth.projeto_id || full.projeto_id };
+}
+async function requireSuperAdmin(request, env) {
+  return await requireRole(request, env, ["superadmin"]);
 }
 
 async function handleLogin(request, env) {
+  await ensureSchema(env);
   const body = await readJson(request);
   const username = String(body?.username ?? body?.user ?? body?.login ?? "").trim();
   const password = String(body?.password ?? body?.pass ?? "");
   if (!username || !password) return json({ error: "missing_credentials" }, 400);
 
   const user = await db(env).prepare(
-    "SELECT username, password_hash, is_active, role FROM users WHERE username=?1"
+    "SELECT username, password_hash, is_active, role, projeto_id FROM users WHERE username=?1"
   ).bind(username).first();
 
   if (!user || !user.is_active) return json({ error: "invalid_credentials" }, 401);
   const ok = await verifyPassword(password, user.password_hash);
   if (!ok) return json({ error: "invalid_credentials" }, 401);
 
-  const role = normalizeRole(user.role);
-  const token = await mintSession(env, username);
-  return json({ ok: true, token, user: { username, role } });
+  const role       = normalizeRole(user.role);
+  const projeto_id = user.projeto_id || "default";
+  const token      = await mintSession(env, username, projeto_id);
+
+  // Busca nome do projeto
+  let projeto_nome = projeto_id;
+  try {
+    const p = await db(env).prepare("SELECT nome FROM projetos WHERE projeto_id=?1").bind(projeto_id).first();
+    if (p?.nome) projeto_nome = p.nome;
+  } catch (_) {}
+
+  return json({ ok: true, token, user: { username, role, projeto_id, projeto_nome } });
 }
 async function handleMe(request, env) {
   try {
     const auth = await requireAuth(request, env);
-    const role = await getUserRole(env, auth.user);
-    return json({ ok: true, user: { username: auth.user, role } });
+    const full = await getUserFull(env, auth.user);
+    let projeto_nome = auth.projeto_id;
+    try {
+      const p = await db(env).prepare("SELECT nome FROM projetos WHERE projeto_id=?1").bind(auth.projeto_id).first();
+      if (p?.nome) projeto_nome = p.nome;
+    } catch (_) {}
+    return json({ ok: true, user: { username: auth.user, role: full.role, projeto_id: auth.projeto_id, projeto_nome } });
   } catch (_e) {
     return json({ error: "unauthorized" }, 401);
   }
@@ -388,11 +426,12 @@ async function ensureSchema(env) {
     `).run();
   } catch (_e) {}
 
-  // Movimentacoes D1 — registros inseridos via app (overrides/remoções)
+  // Movimentacoes D1
   try {
     await db(env).prepare(`
       CREATE TABLE IF NOT EXISTS movimentacoes_d1 (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        projeto_id TEXT NOT NULL DEFAULT 'default',
         DATA       TEXT,
         CTO_ID     TEXT NOT NULL,
         Tipo       TEXT NOT NULL,
@@ -403,6 +442,48 @@ async function ensureSchema(env) {
       )
     `).run();
   } catch (_e) {}
+
+  // Tabela projetos (multi-tenant)
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS projetos (
+        projeto_id TEXT PRIMARY KEY,
+        nome       TEXT NOT NULL,
+        plano      TEXT NOT NULL DEFAULT 'basico',
+        ativo      INTEGER NOT NULL DEFAULT 1,
+        criado_em  TEXT,
+        config     TEXT
+      )
+    `).run();
+  } catch (_e) {}
+
+  // Garante projeto "default" para dados legados
+  try {
+    const def = await db(env).prepare("SELECT projeto_id FROM projetos WHERE projeto_id='default'").first();
+    if (!def) {
+      await db(env).prepare(
+        "INSERT INTO projetos (projeto_id, nome, plano, ativo, criado_em) VALUES ('default','Projeto Principal','pro',1,datetime('now'))"
+      ).run();
+    }
+  } catch (_e) {}
+
+  // Adiciona projeto_id em todas as tabelas (ALTER TABLE ADD COLUMN — ignora se já existe)
+  const tablesWithProjeto = [
+    "ctos", "caixas_emenda_cdo", "rotas",
+    "users", "sessions", "movimentacoes_d1"
+  ];
+  for (const tbl of tablesWithProjeto) {
+    try {
+      await db(env).prepare(`ALTER TABLE ${tbl} ADD COLUMN projeto_id TEXT NOT NULL DEFAULT 'default'`).run();
+    } catch (_e) { /* já existe — ok */ }
+  }
+
+  // Migra linhas sem projeto_id para 'default'
+  for (const tbl of ["ctos","caixas_emenda_cdo","rotas","users","movimentacoes_d1"]) {
+    try {
+      await db(env).prepare(`UPDATE ${tbl} SET projeto_id='default' WHERE projeto_id IS NULL OR projeto_id=''`).run();
+    } catch (_e) {}
+  }
 }
 
 // ======================= Helpers de senha =======================
@@ -423,40 +504,236 @@ async function hashPassword(password) {
   return `pbkdf2$${iter}$${saltB64}$${hashB64}`;
 }
 
+
+// ======================= Gerenciamento de Projetos (superadmin) =======================
+
+// GET /api/projetos
+async function handleListProjetos(request, env) {
+  try {
+    await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const rows = await db(env).prepare(
+      "SELECT projeto_id, nome, plano, ativo, criado_em, config FROM projetos ORDER BY criado_em DESC"
+    ).all();
+    const projetos = rows?.results || [];
+
+    // Conta usuários e CTOs por projeto em paralelo
+    const [usersRes, ctosRes, movsRes] = await Promise.allSettled([
+      db(env).prepare("SELECT projeto_id, COUNT(*) as total FROM users GROUP BY projeto_id").all(),
+      db(env).prepare("SELECT projeto_id, COUNT(*) as total FROM ctos GROUP BY projeto_id").all(),
+      db(env).prepare("SELECT projeto_id, COUNT(*) as total FROM movimentacoes_d1 GROUP BY projeto_id").all()
+    ]);
+
+    const usersMap = new Map((usersRes.value?.results || []).map(r => [r.projeto_id, r.total]));
+    const ctosMap  = new Map((ctosRes.value?.results  || []).map(r => [r.projeto_id, r.total]));
+    const movsMap  = new Map((movsRes.value?.results  || []).map(r => [r.projeto_id, r.total]));
+
+    const items = projetos.map(p => ({
+      projeto_id:   p.projeto_id,
+      nome:         p.nome,
+      plano:        p.plano || "basico",
+      ativo:        p.ativo === 1 || p.ativo === true,
+      criado_em:    p.criado_em || "",
+      config:       p.config   || null,
+      stats: {
+        usuarios:     usersMap.get(p.projeto_id) || 0,
+        ctos:         ctosMap.get(p.projeto_id)  || 0,
+        movimentacoes:movsMap.get(p.projeto_id)  || 0
+      }
+    }));
+    return json({ ok: true, items });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// GET /api/projetos/stats — stats do próprio projeto (admin)
+async function handleProjetoStats(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
+    await ensureSchema(env);
+    const url = new URL(request.url);
+    const pid = auth.role === "superadmin"
+      ? (s(url.searchParams.get("projeto_id")) || auth.projeto_id)
+      : auth.projeto_id;
+
+    const [usersRes, ctosRes, rotasRes, movsRes] = await Promise.allSettled([
+      db(env).prepare("SELECT COUNT(*) as t FROM users WHERE projeto_id=?1 AND is_active=1").bind(pid).first(),
+      db(env).prepare("SELECT COUNT(*) as t FROM ctos WHERE projeto_id=?1").bind(pid).first(),
+      db(env).prepare("SELECT COUNT(*) as t FROM rotas WHERE projeto_id=?1").bind(pid).first(),
+      db(env).prepare("SELECT COUNT(*) as t FROM movimentacoes_d1 WHERE projeto_id=?1").bind(pid).first()
+    ]);
+
+    const proj = await db(env).prepare("SELECT nome, plano, ativo FROM projetos WHERE projeto_id=?1").bind(pid).first();
+    return json({
+      ok: true,
+      projeto_id: pid,
+      nome:  proj?.nome  || pid,
+      plano: proj?.plano || "basico",
+      ativo: proj?.ativo !== 0,
+      stats: {
+        usuarios:      usersRes.value?.t  || 0,
+        ctos:          ctosRes.value?.t   || 0,
+        rotas:         rotasRes.value?.t  || 0,
+        movimentacoes: movsRes.value?.t   || 0
+      }
+    });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/projetos — cria ou atualiza projeto + cria admin inicial
+// Body: { projeto_id, nome, plano?, ativo?, admin_username?, admin_password? }
+async function handleUpsertProjeto(request, env) {
+  try {
+    await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const body = await readJson(request);
+
+    let projeto_id   = s(body?.projeto_id || "").toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    const nome       = s(body?.nome || "").trim();
+    const plano      = ["basico","pro","enterprise"].includes(body?.plano) ? body.plano : "basico";
+    const ativo      = body?.ativo !== false ? 1 : 0;
+    const adminUser  = s(body?.admin_username || "").trim().toLowerCase();
+    const adminPass  = s(body?.admin_password || "").trim();
+
+    if (!nome) return json({ error: "nome_required" }, 400);
+
+    // Gera projeto_id se não informado
+    if (!projeto_id) {
+      projeto_id = nome.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20) +
+                   "_" + Date.now().toString(36);
+    }
+
+    const now = new Date().toISOString();
+    const existing = await db(env).prepare(
+      "SELECT projeto_id FROM projetos WHERE projeto_id=?1"
+    ).bind(projeto_id).first();
+
+    if (existing) {
+      await db(env).prepare(
+        "UPDATE projetos SET nome=?2, plano=?3, ativo=?4 WHERE projeto_id=?1"
+      ).bind(projeto_id, nome, plano, ativo).run();
+    } else {
+      await db(env).prepare(
+        "INSERT INTO projetos (projeto_id, nome, plano, ativo, criado_em) VALUES (?1,?2,?3,?4,?5)"
+      ).bind(projeto_id, nome, plano, ativo, now).run();
+    }
+
+    // Se veio admin_username + admin_password, cria/atualiza o admin do projeto
+    let adminCreated = false;
+    if (adminUser && adminPass && adminPass.length >= 4) {
+      const hash = await hashPassword(adminPass);
+      const existingAdmin = await db(env).prepare(
+        "SELECT username FROM users WHERE username=?1"
+      ).bind(adminUser).first();
+      if (existingAdmin) {
+        await db(env).prepare(
+          "UPDATE users SET password_hash=?1, role='admin', is_active=1, projeto_id=?2, updated_at=?3 WHERE username=?4"
+        ).bind(hash, projeto_id, now, adminUser).run();
+      } else {
+        await db(env).prepare(
+          "INSERT INTO users (username, password_hash, role, is_active, projeto_id, created_at, updated_at) VALUES (?1,?2,'admin',1,?3,?4,?4)"
+        ).bind(adminUser, hash, projeto_id, now).run();
+      }
+      adminCreated = true;
+    }
+
+    return json({ ok: true, projeto_id, nome, plano, ativo: ativo === 1, admin_created: adminCreated, action: existing ? "updated" : "created" });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// DELETE /api/projetos — desativa ou remove projeto
+// Body: { projeto_id, force?: true } — force=true remove todos os dados
+async function handleDeleteProjeto(request, env) {
+  try {
+    await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const body       = await readJson(request);
+    const projeto_id = s(body?.projeto_id || "").trim();
+    const force      = body?.force === true;
+
+    if (!projeto_id) return json({ error: "projeto_id_required" }, 400);
+    if (projeto_id === "default") return json({ error: "cannot_delete_default" }, 400);
+
+    if (force) {
+      // Remove todos os dados do projeto
+      await db(env).batch([
+        db(env).prepare("DELETE FROM ctos                WHERE projeto_id=?1").bind(projeto_id),
+        db(env).prepare("DELETE FROM caixas_emenda_cdo   WHERE projeto_id=?1").bind(projeto_id),
+        db(env).prepare("DELETE FROM rotas               WHERE projeto_id=?1").bind(projeto_id),
+        db(env).prepare("DELETE FROM movimentacoes_d1    WHERE projeto_id=?1").bind(projeto_id),
+        db(env).prepare("DELETE FROM sessions WHERE username IN (SELECT username FROM users WHERE projeto_id=?1)").bind(projeto_id),
+        db(env).prepare("DELETE FROM users               WHERE projeto_id=?1").bind(projeto_id),
+        db(env).prepare("DELETE FROM projetos            WHERE projeto_id=?1").bind(projeto_id)
+      ]);
+      return json({ ok: true, action: "deleted", projeto_id });
+    } else {
+      // Apenas desativa
+      await db(env).prepare("UPDATE projetos SET ativo=0 WHERE projeto_id=?1").bind(projeto_id).run();
+      // Invalida sessões dos usuários do projeto
+      await db(env).prepare(
+        "DELETE FROM sessions WHERE username IN (SELECT username FROM users WHERE projeto_id=?1)"
+      ).bind(projeto_id).run();
+      return json({ ok: true, action: "deactivated", projeto_id });
+    }
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
 // ======================= Handlers de usuários =======================
 
-// GET /api/users — lista todos os usuários (admin)
+// GET /api/users — lista usuários do projeto (admin) ou todos (superadmin)
 async function handleListUsers(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
-    const res = await db(env).prepare(
-      "SELECT username, role, is_active, created_at, updated_at FROM users ORDER BY username"
-    ).all();
+    const url = new URL(request.url);
+    // superadmin pode filtrar por projeto_id via ?projeto_id=
+    const pid = auth.role === "superadmin"
+      ? s(url.searchParams.get("projeto_id") || auth.projeto_id)
+      : auth.projeto_id;
+
+    const res = auth.role === "superadmin" && !url.searchParams.get("projeto_id")
+      ? await db(env).prepare("SELECT username, role, projeto_id, is_active, created_at, updated_at FROM users ORDER BY projeto_id, username").all()
+      : await db(env).prepare("SELECT username, role, projeto_id, is_active, created_at, updated_at FROM users WHERE projeto_id=?1 ORDER BY username").bind(pid).all();
+
     const items = (res?.results || []).map(u => ({
       username:   u.username,
       role:       u.role || "user",
+      projeto_id: u.projeto_id || "default",
       is_active:  u.is_active === 1 || u.is_active === true,
       created_at: u.created_at || "",
       updated_at: u.updated_at || ""
     }));
     return json({ ok: true, items });
   } catch (e) {
-    if (e.code === "forbidden") return json({ error: "forbidden" }, 403);
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
   }
 }
 
-// POST /api/users — cria ou atualiza usuário { username, password, role }
+// POST /api/users — cria ou atualiza usuário { username, password, role, projeto_id? }
 async function handleUpsertUser(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body = await readJson(request);
     const username = String(body?.username || "").trim().toLowerCase();
     const password = String(body?.password || "");
-    const role     = String(body?.role || "user").trim().toLowerCase();
     const active   = body?.is_active !== false ? 1 : 0;
 
     if (!username) return json({ error: "username_required" }, 400);
@@ -464,31 +741,44 @@ async function handleUpsertUser(request, env) {
     if (username.length < 2) return json({ error: "username_too_short" }, 400);
     if (password.length < 4) return json({ error: "password_too_short" }, 400);
 
-    const validRoles = ["admin", "user", "tecnico", "viewer"];
-    const finalRole = validRoles.includes(role) ? role : "user";
+    // admin só pode criar roles abaixo do seu nível
+    const requestedRole = String(body?.role || "user").trim().toLowerCase();
+    const validRoles = auth.role === "superadmin"
+      ? ["superadmin","admin","tecnico","user"]
+      : ["admin","tecnico","user"];
+    const finalRole = validRoles.includes(requestedRole) ? requestedRole : "user";
+
+    // projeto_id: superadmin pode especificar qualquer projeto; admin usa o próprio
+    const finalProjeto = auth.role === "superadmin" && body?.projeto_id
+      ? String(body.projeto_id).trim()
+      : auth.projeto_id;
 
     const hash = await hashPassword(password);
     const now  = new Date().toISOString();
 
-    // UPSERT: atualiza se existe, insere se não existe
     const existing = await db(env).prepare(
-      "SELECT username FROM users WHERE username=?1"
+      "SELECT username, projeto_id FROM users WHERE username=?1"
     ).bind(username).first();
+
+    // Admin só pode editar usuários do próprio projeto
+    if (existing && auth.role !== "superadmin" && existing.projeto_id !== auth.projeto_id) {
+      return json({ error: "forbidden" }, 403);
+    }
 
     if (existing) {
       await db(env).prepare(
-        "UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4 WHERE username=?5"
-      ).bind(hash, finalRole, active, now, username).run();
+        "UPDATE users SET password_hash=?1, role=?2, is_active=?3, updated_at=?4, projeto_id=?5 WHERE username=?6"
+      ).bind(hash, finalRole, active, now, finalProjeto, username).run();
     } else {
       await db(env).prepare(
-        "INSERT INTO users (username, password_hash, role, is_active, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?5)"
-      ).bind(username, hash, finalRole, active, now).run();
+        "INSERT INTO users (username, password_hash, role, is_active, projeto_id, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?6)"
+      ).bind(username, hash, finalRole, active, finalProjeto, now).run();
     }
 
-    return json({ ok: true, username, role: finalRole, is_active: active === 1, action: existing ? "updated" : "created" });
+    return json({ ok: true, username, role: finalRole, projeto_id: finalProjeto, is_active: active === 1, action: existing ? "updated" : "created" });
   } catch (e) {
-    if (e.code === "forbidden")     return json({ error: "forbidden" }, 403);
-    if (e.code === "unauthorized")  return json({ error: "unauthorized" }, 401);
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
   }
 }
@@ -734,34 +1024,17 @@ const body = await readJson(request) || {};
     if (action !== "DELETE" && (cto.LAT === null || cto.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
 
     if (action === "DELETE") {
-      await db(env).prepare("DELETE FROM ctos WHERE cto_id=?1").bind(cto.CTO_ID).run();
+      const pid_cto = auth.projeto_id || "default";
+      await db(env).prepare("DELETE FROM ctos WHERE cto_id=?1 AND projeto_id=?2").bind(cto.CTO_ID, pid_cto).run();
     } else {
       const upd = await db(env).prepare(
-        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8 WHERE cto_id=?1"
-      ).bind(
-        cto.CTO_ID,
-        s(cto.NOME),
-        s(cto.RUA),
-        s(cto.BAIRRO),
-        intOrNull(cto.CAPACIDADE),
-        num(cto.LAT),
-        num(cto.LNG),
-        new Date().toISOString()
-      ).run();
+        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8 WHERE cto_id=?1 AND projeto_id=?9"
+      ).bind(cto.CTO_ID, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString(), pid_cto).run();
 
       if (!upd || !upd.meta || upd.meta.changes === 0) {
         await db(env).prepare(
-          "INSERT INTO ctos (cto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-        ).bind(
-          cto.CTO_ID,
-          s(cto.NOME),
-          s(cto.RUA),
-          s(cto.BAIRRO),
-          intOrNull(cto.CAPACIDADE),
-          num(cto.LAT),
-          num(cto.LNG),
-          new Date().toISOString()
-        ).run();
+          "INSERT INTO ctos (cto_id, projeto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+        ).bind(cto.CTO_ID, pid_cto, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString()).run();
       }
     }
 
@@ -797,33 +1070,18 @@ const body = await readJson(request) || {};
     if (action !== "DELETE" && (cx.LAT === null || cx.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
 
     if (action === "DELETE") {
-      await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1").bind(cx.ID).run();
+      const pid_cx = auth.projeto_id || "default";
+      await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2").bind(cx.ID, pid_cx).run();
     } else {
       // Update first (works even if no UNIQUE constraint; if none matched, insert)
       const upd = await db(env).prepare(
-        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7 WHERE id=?1"
-      ).bind(
-        cx.ID,
-        s(cx.TIPO),
-        s(cx.OBS),
-        s(cx.IMG_URL),
-        num(cx.LAT),
-        num(cx.LNG),
-        new Date().toISOString()
-      ).run();
+        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7 WHERE id=?1 AND projeto_id=?8"
+      ).bind(cx.ID, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString(), pid_cx).run();
 
       if (!upd || !upd.meta || upd.meta.changes === 0) {
         await db(env).prepare(
-          "INSERT INTO caixas_emenda_cdo (id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
-        ).bind(
-          cx.ID,
-          s(cx.TIPO),
-          s(cx.OBS),
-          s(cx.IMG_URL),
-          num(cx.LAT),
-          num(cx.LNG),
-          new Date().toISOString()
-        ).run();
+          "INSERT INTO caixas_emenda_cdo (id, projeto_id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
+        ).bind(cx.ID, pid_cx, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString()).run();
       }
     }
 
@@ -859,7 +1117,8 @@ const body = await readJson(request) || {};
     if (!rota_id) return json({ ok: false, error: "missing_rota_id" }, 400);
 
     if (action === "DELETE") {
-      await db(env).prepare("DELETE FROM rotas WHERE rota_id=?1").bind(rota_id).run();
+      const pid_r = auth.projeto_id || "default";
+      await db(env).prepare("DELETE FROM rotas WHERE rota_id=?1 AND projeto_id=?2").bind(rota_id, pid_r).run();
     } else {
       if (!geojsonRaw) return json({ ok: false, error: "missing_geojson", message: "O campo geojson é obrigatório para salvar uma rota." }, 400);
       if (typeof geojsonRaw === "string") {
@@ -868,23 +1127,13 @@ const body = await readJson(request) || {};
       // normalize to string
       const geojsonText = (typeof geojsonRaw === "string") ? geojsonRaw : JSON.stringify(geojsonRaw || {});
       const upd = await db(env).prepare(
-        "UPDATE rotas SET nome=?2, geojson=?3, updated_at=?4 WHERE rota_id=?1"
-      ).bind(
-        rota_id,
-        nome,
-        geojsonText,
-        new Date().toISOString()
-      ).run();
+        "UPDATE rotas SET nome=?2, geojson=?3, updated_at=?4 WHERE rota_id=?1 AND projeto_id=?5"
+      ).bind(rota_id, nome, geojsonText, new Date().toISOString(), pid_r).run();
 
       if (!upd || !upd.meta || upd.meta.changes === 0) {
         await db(env).prepare(
-          "INSERT INTO rotas (rota_id, nome, geojson, updated_at) VALUES (?1,?2,?3,?4)"
-        ).bind(
-          rota_id,
-          nome,
-          geojsonText,
-          new Date().toISOString()
-        ).run();
+          "INSERT INTO rotas (rota_id, projeto_id, nome, geojson, updated_at) VALUES (?1,?2,?3,?4,?5)"
+        ).bind(rota_id, pid_r, nome, geojsonText, new Date().toISOString()).run();
       }
     }
 
@@ -983,9 +1232,11 @@ async function handleGetCtos(request, env) {
     await requireViewer(request, env);
     await ensureSchema(env);
 
+    const auth = await requireViewer(request, env);
+    const pid  = auth.projeto_id || "default";
     const rows = await db(env).prepare(
-      "SELECT * FROM ctos ORDER BY cto_id"
-    ).all();
+      "SELECT * FROM ctos WHERE projeto_id=?1 ORDER BY cto_id"
+    ).bind(pid).all();
 
     const items = (rows?.results || []).map(r => {
       const cto_id = s(r.cto_id || r.CTO_ID || r.id || r.ID || r.codigo || r.code);
@@ -1041,9 +1292,11 @@ async function handleGetCaixas(request, env) {
     await requireViewer(request, env);
 
         await ensureSchema(env);
-const rows = await db(env).prepare(
-      "SELECT * FROM caixas_emenda_cdo ORDER BY id"
-    ).all();
+const auth = await requireViewer(request, env);
+    const pid  = auth.projeto_id || "default";
+    const rows = await db(env).prepare(
+      "SELECT * FROM caixas_emenda_cdo WHERE projeto_id=?1 ORDER BY id"
+    ).bind(pid).all();
 
     const items = (rows?.results || []).map(r => {
       const id = s(r.id || r.caixa_id || r.ID || r.codigo || r.code);
@@ -1080,8 +1333,10 @@ async function handleGetRotas(request, env) {
     const url = new URL(request.url);
     const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "").trim();
 
+    const auth = await requireViewer(request, env);
+    const pid  = auth.projeto_id || "default";
     // Schema-flexible read
-    const rows = await db(env).prepare("SELECT * FROM rotas").all();
+    const rows = await db(env).prepare("SELECT * FROM rotas WHERE projeto_id=?1").bind(pid).all();
 
     const items = [];
     const features = [];
@@ -1149,11 +1404,12 @@ async function handleGetMovimentacoes(request, env) {
 
     // D1 é a fonte principal. CSV do Sheets só é usado se não houver nenhum registro no D1
     // (modo de compatibilidade para quem ainda não migrou).
+    const pid_mov = auth.projeto_id || "default";
     const d1Res = await db(env).prepare(
       ctoId
-        ? "SELECT * FROM movimentacoes_d1 WHERE CTO_ID=?1 ORDER BY id DESC LIMIT ?2"
-        : "SELECT * FROM movimentacoes_d1 ORDER BY id DESC LIMIT ?1"
-    ).bind(...(ctoId ? [ctoId, limit] : [limit])).all();
+        ? "SELECT * FROM movimentacoes_d1 WHERE projeto_id=?1 AND CTO_ID=?2 ORDER BY id DESC LIMIT ?3"
+        : "SELECT * FROM movimentacoes_d1 WHERE projeto_id=?1 ORDER BY id DESC LIMIT ?2"
+    ).bind(...(ctoId ? [pid_mov, ctoId, limit] : [pid_mov, limit])).all();
 
     const d1Items = (d1Res?.results || []);
 
@@ -1253,7 +1509,7 @@ async function handleImportMovimentacoes(request, env) {
     for (let i = 0; i < items.length; i += 100) {
       const batch = items.slice(i, i + 100);
       const stmt = db(env).prepare(
-        "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+        "INSERT INTO movimentacoes_d1 (projeto_id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
       );
       await db(env).batch(batch.map(r => {
         const cto   = s(r.CTO_ID || r.cto_id || "");
@@ -1261,7 +1517,9 @@ async function handleImportMovimentacoes(request, env) {
         const cli   = s(r.Cliente || r.cliente || "");
         if (!cto || !tipo || !cli) { skipped++; return stmt.bind("","","","","","",""); }
         inserted++;
+        const pid_imp = auth.projeto_id || "default";
         return stmt.bind(
+          pid_imp,
           s(r.DATA || r.data || new Date().toISOString()),
           cto, tipo, cli,
           s(r.Usuario || r.usuario || ""),
@@ -1294,10 +1552,11 @@ async function handleAddMovimentacao(request, env) {
     const usuario = s(body?.Usuario  || body?.usuario  || "");
     const obs     = s(body?.Observacao || body?.observacao || "");
     if (!cto_id || !tipo || !cliente) return json({ error: "missing_fields" }, 400);
-    const now = new Date().toISOString();
+    const now     = new Date().toISOString();
+    const pid_add = auth.projeto_id || "default";
     await db(env).prepare(
-      "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?1)"
-    ).bind(now, cto_id, tipo, cliente, usuario, obs).run();
+      "INSERT INTO movimentacoes_d1 (projeto_id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?2)"
+    ).bind(pid_add, now, cto_id, tipo, cliente, usuario, obs).run();
     return json({ ok: true, action: "inserted" });
   } catch (e) {
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
@@ -1316,10 +1575,11 @@ async function handleRemoveCliente(request, env) {
     const cliente = s(body?.cliente  || body?.Cliente  || "");
     const usuario = s(body?.usuario  || body?.Usuario  || "");
     if (!cto_id || !cliente) return json({ error: "missing_fields: cto_id, cliente" }, 400);
-    const now = new Date().toISOString();
+    const now     = new Date().toISOString();
+    const pid_rem = auth.projeto_id || "default";
     await db(env).prepare(
-      "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,'DESATIVACAO',?3,?4,'Removido pelo admin',?1)"
-    ).bind(now, cto_id, cliente, usuario).run();
+      "INSERT INTO movimentacoes_d1 (projeto_id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,'DESATIVACAO',?4,?5,'Removido pelo admin',?2)"
+    ).bind(pid_rem, now, cto_id, cliente, usuario).run();
     return json({ ok: true, action: "removed", cto_id, cliente });
   } catch (e) {
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
