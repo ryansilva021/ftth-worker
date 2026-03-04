@@ -80,7 +80,9 @@ export default {
       if (pathname === "/api/ctos" && request.method === "GET") return corsResponse(request, await handleGetCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && request.method === "GET") return corsResponse(request, await handleGetCaixas(request, env));
       if (pathname === "/api/rotas_fibras" && request.method === "GET") return corsResponse(request, await handleGetRotas(request, env));
-      if (pathname === "/api/movimentacoes" && request.method === "GET") return corsResponse(request, await handleGetMovimentacoes(request, env));
+      if (pathname === "/api/movimentacoes" && request.method === "GET")    return corsResponse(request, await handleGetMovimentacoes(request, env));
+      if (pathname === "/api/movimentacoes" && request.method === "POST")   return corsResponse(request, await handleAddMovimentacao(request, env));
+      if (pathname === "/api/movimentacoes/remove-cliente" && request.method === "POST") return corsResponse(request, await handleRemoveCliente(request, env));
       if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
 
@@ -380,6 +382,22 @@ async function ensureSchema(env) {
         username   TEXT NOT NULL,
         created_at TEXT,
         expires_at TEXT
+      )
+    `).run();
+  } catch (_e) {}
+
+  // Movimentacoes D1 — registros inseridos via app (overrides/remoções)
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS movimentacoes_d1 (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        DATA       TEXT,
+        CTO_ID     TEXT NOT NULL,
+        Tipo       TEXT NOT NULL,
+        Cliente    TEXT NOT NULL,
+        Usuario    TEXT,
+        Observacao TEXT,
+        created_at TEXT
       )
     `).run();
   } catch (_e) {}
@@ -1121,19 +1139,89 @@ async function handleGetRotas(request, env) {
 async function handleGetMovimentacoes(request, env) {
   try {
     await requireViewer(request, env);
-    const csvUrl = getCsvUrl(env, "MOV");
-    const rows = await fetchCSV(csvUrl);
-    const items = rows.map(r => ({
-      DATA: s(r.DATA || r.data),
-      CTO_ID: s(r.CTO_ID || r.cto_id),
-      Tipo: s(r.Tipo ?? r.TIPO ?? r.tipo),
-      Cliente: s(r.Cliente ?? r.CLIENTE ?? r.cliente),
-      Usuario: s(r.Usuario ?? r.USUARIO ?? r.usuario),
-      Observacao: s(r.Observacao ?? r.OBSERVACAO ?? r.observacao)
+    await ensureSchema(env);
+
+    // Busca CSV (Google Sheets) + D1 em paralelo
+    const [csvRows, d1Res] = await Promise.allSettled([
+      (async () => {
+        const csvUrl = getCsvUrl(env, "MOV");
+        return csvUrl ? fetchCSV(csvUrl) : [];
+      })(),
+      db(env).prepare("SELECT * FROM movimentacoes_d1 ORDER BY id ASC").all()
+    ]);
+
+    const fromCsv = (csvRows.status === "fulfilled" ? csvRows.value : []).map(r => ({
+      DATA:      s(r.DATA || r.data),
+      CTO_ID:    s(r.CTO_ID || r.cto_id),
+      Tipo:      s(r.Tipo ?? r.TIPO ?? r.tipo),
+      Cliente:   s(r.Cliente ?? r.CLIENTE ?? r.cliente),
+      Usuario:   s(r.Usuario ?? r.USUARIO ?? r.usuario),
+      Observacao:s(r.Observacao ?? r.OBSERVACAO ?? r.observacao),
+      _source:   "csv"
     }));
-    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 30 });
+
+    const fromD1 = (d1Res.status === "fulfilled" ? (d1Res.value?.results || []) : []).map(r => ({
+      DATA:      s(r.DATA),
+      CTO_ID:    s(r.CTO_ID),
+      Tipo:      s(r.Tipo),
+      Cliente:   s(r.Cliente),
+      Usuario:   s(r.Usuario),
+      Observacao:s(r.Observacao),
+      _source:   "d1"
+    }));
+
+    // D1 overrides ficam no final — assim o cálculo de "última ação por cliente"
+    // usa o D1 (DESATIVACAO inserida pelo admin) como mais recente
+    const items = [...fromCsv, ...fromD1];
+    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 15 });
   } catch (e) {
     return json({ ok: false, error: "mov_failed", message: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/movimentacoes — insere movimentação manual no D1
+async function handleAddMovimentacao(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body    = await readJson(request);
+    const cto_id  = s(body?.CTO_ID  || body?.cto_id  || "");
+    const tipo    = s(body?.Tipo     || body?.tipo     || "");
+    const cliente = s(body?.Cliente  || body?.cliente  || "");
+    const usuario = s(body?.Usuario  || body?.usuario  || "");
+    const obs     = s(body?.Observacao || body?.observacao || "");
+    if (!cto_id || !tipo || !cliente) return json({ error: "missing_fields" }, 400);
+    const now = new Date().toISOString();
+    await db(env).prepare(
+      "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?1)"
+    ).bind(now, cto_id, tipo, cliente, usuario, obs).run();
+    return json({ ok: true, action: "inserted" });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/movimentacoes/remove-cliente — desativa cliente (insere DESATIVACAO no D1)
+async function handleRemoveCliente(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body    = await readJson(request);
+    const cto_id  = s(body?.cto_id  || body?.CTO_ID  || "");
+    const cliente = s(body?.cliente  || body?.Cliente  || "");
+    const usuario = s(body?.usuario  || body?.Usuario  || "");
+    if (!cto_id || !cliente) return json({ error: "missing_fields: cto_id, cliente" }, 400);
+    const now = new Date().toISOString();
+    await db(env).prepare(
+      "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,'DESATIVACAO',?3,?4,'Removido pelo admin',?1)"
+    ).bind(now, cto_id, cliente, usuario).run();
+    return json({ ok: true, action: "removed", cto_id, cliente });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
   }
 }
 
