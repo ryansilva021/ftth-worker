@@ -1229,10 +1229,8 @@ async function requireViewer(request, env) {
 // ======================= GET: CTOs / Caixas / Rotas =======================
 async function handleGetCtos(request, env) {
   try {
-    await requireViewer(request, env);
-    await ensureSchema(env);
-
     const auth = await requireViewer(request, env);
+    await ensureSchema(env);
     const pid  = auth.projeto_id || "default";
     const rows = await db(env).prepare(
       "SELECT * FROM ctos WHERE projeto_id=?1 ORDER BY cto_id"
@@ -1289,10 +1287,8 @@ async function handleGetCtos(request, env) {
 
 async function handleGetCaixas(request, env) {
   try {
-    await requireViewer(request, env);
-
-        await ensureSchema(env);
-const auth = await requireViewer(request, env);
+    const auth = await requireViewer(request, env);
+    await ensureSchema(env);
     const pid  = auth.projeto_id || "default";
     const rows = await db(env).prepare(
       "SELECT * FROM caixas_emenda_cdo WHERE projeto_id=?1 ORDER BY id"
@@ -1327,13 +1323,11 @@ const auth = await requireViewer(request, env);
 
 async function handleGetRotas(request, env) {
   try {
-    await requireViewer(request, env);
+    const auth = await requireViewer(request, env);
     await ensureSchema(env);
 
     const url = new URL(request.url);
     const rotaIdFilter = s(url.searchParams.get("rota_id") || url.searchParams.get("id") || "").trim();
-
-    const auth = await requireViewer(request, env);
     const pid  = auth.projeto_id || "default";
     // Schema-flexible read
     const rows = await db(env).prepare("SELECT * FROM rotas WHERE projeto_id=?1").bind(pid).all();
@@ -1395,15 +1389,13 @@ async function handleGetRotas(request, env) {
 
 async function handleGetMovimentacoes(request, env) {
   try {
-    await requireViewer(request, env);
+    const auth = await requireViewer(request, env);
     await ensureSchema(env);
 
     const url    = new URL(request.url);
     const ctoId  = s(url.searchParams.get("cto_id") || "");
     const limit  = Math.min(Number(url.searchParams.get("limit") || 2000), 5000);
 
-    // D1 é a fonte principal. CSV do Sheets só é usado se não houver nenhum registro no D1
-    // (modo de compatibilidade para quem ainda não migrou).
     const pid_mov = auth.projeto_id || "default";
     const d1Res = await db(env).prepare(
       ctoId
