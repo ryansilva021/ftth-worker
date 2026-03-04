@@ -83,6 +83,8 @@ export default {
       if (pathname === "/api/movimentacoes" && request.method === "GET")    return corsResponse(request, await handleGetMovimentacoes(request, env));
       if (pathname === "/api/movimentacoes" && request.method === "POST")   return corsResponse(request, await handleAddMovimentacao(request, env));
       if (pathname === "/api/movimentacoes/remove-cliente" && request.method === "POST") return corsResponse(request, await handleRemoveCliente(request, env));
+      if (pathname === "/api/movimentacoes/import"  && request.method === "POST") return corsResponse(request, await handleImportMovimentacoes(request, env));
+      if (pathname === "/api/movimentacoes/export"  && request.method === "GET")  return corsResponse(request, await handleExportMovimentacoes(request, env));
       if (pathname === "/api/usuarios" && request.method === "GET") return corsResponse(request, await handleGetUsuarios(request, env));
       if (pathname === "/api/log_eventos" && request.method === "GET") return corsResponse(request, await handleGetLogEventos(request, env));
 
@@ -1141,41 +1143,142 @@ async function handleGetMovimentacoes(request, env) {
     await requireViewer(request, env);
     await ensureSchema(env);
 
-    // Busca CSV (Google Sheets) + D1 em paralelo
-    const [csvRows, d1Res] = await Promise.allSettled([
-      (async () => {
+    const url    = new URL(request.url);
+    const ctoId  = s(url.searchParams.get("cto_id") || "");
+    const limit  = Math.min(Number(url.searchParams.get("limit") || 2000), 5000);
+
+    // D1 é a fonte principal. CSV do Sheets só é usado se não houver nenhum registro no D1
+    // (modo de compatibilidade para quem ainda não migrou).
+    const d1Res = await db(env).prepare(
+      ctoId
+        ? "SELECT * FROM movimentacoes_d1 WHERE CTO_ID=?1 ORDER BY id DESC LIMIT ?2"
+        : "SELECT * FROM movimentacoes_d1 ORDER BY id DESC LIMIT ?1"
+    ).bind(...(ctoId ? [ctoId, limit] : [limit])).all();
+
+    const d1Items = (d1Res?.results || []);
+
+    // Se D1 vazio, tenta CSV legado para não quebrar instalações antigas
+    let items = [];
+    if (d1Items.length === 0) {
+      try {
         const csvUrl = getCsvUrl(env, "MOV");
-        return csvUrl ? fetchCSV(csvUrl) : [];
-      })(),
-      db(env).prepare("SELECT * FROM movimentacoes_d1 ORDER BY id ASC").all()
-    ]);
+        if (csvUrl) {
+          const rows = await fetchCSV(csvUrl);
+          items = rows.map(r => ({
+            id:        null,
+            DATA:      s(r.DATA || r.data),
+            CTO_ID:    s(r.CTO_ID || r.cto_id),
+            Tipo:      s(r.Tipo ?? r.TIPO ?? r.tipo),
+            Cliente:   s(r.Cliente ?? r.CLIENTE ?? r.cliente),
+            Usuario:   s(r.Usuario ?? r.USUARIO ?? r.usuario),
+            Observacao:s(r.Observacao ?? r.OBSERVACAO ?? r.observacao),
+            _source:   "csv_legado"
+          }));
+        }
+      } catch (_) { /* CSV não disponível — OK */ }
+    } else {
+      // Ordena do mais antigo para o mais novo (frontend espera ordem cronológica)
+      items = d1Items.reverse().map(r => ({
+        id:        r.id,
+        DATA:      s(r.DATA),
+        CTO_ID:    s(r.CTO_ID),
+        Tipo:      s(r.Tipo),
+        Cliente:   s(r.Cliente),
+        Usuario:   s(r.Usuario),
+        Observacao:s(r.Observacao),
+        _source:   "d1"
+      }));
+    }
 
-    const fromCsv = (csvRows.status === "fulfilled" ? csvRows.value : []).map(r => ({
-      DATA:      s(r.DATA || r.data),
-      CTO_ID:    s(r.CTO_ID || r.cto_id),
-      Tipo:      s(r.Tipo ?? r.TIPO ?? r.tipo),
-      Cliente:   s(r.Cliente ?? r.CLIENTE ?? r.cliente),
-      Usuario:   s(r.Usuario ?? r.USUARIO ?? r.usuario),
-      Observacao:s(r.Observacao ?? r.OBSERVACAO ?? r.observacao),
-      _source:   "csv"
-    }));
-
-    const fromD1 = (d1Res.status === "fulfilled" ? (d1Res.value?.results || []) : []).map(r => ({
-      DATA:      s(r.DATA),
-      CTO_ID:    s(r.CTO_ID),
-      Tipo:      s(r.Tipo),
-      Cliente:   s(r.Cliente),
-      Usuario:   s(r.Usuario),
-      Observacao:s(r.Observacao),
-      _source:   "d1"
-    }));
-
-    // D1 overrides ficam no final — assim o cálculo de "última ação por cliente"
-    // usa o D1 (DESATIVACAO inserida pelo admin) como mais recente
-    const items = [...fromCsv, ...fromD1];
-    return json({ ok: true, items, data: items }, 200, { cacheSeconds: 15 });
+    return json({ ok: true, items, data: items, total: items.length }, 200, { cacheSeconds: 10 });
   } catch (e) {
     return json({ ok: false, error: "mov_failed", message: String(e?.message || e) }, 500);
+  }
+}
+
+// GET /api/movimentacoes/export — exporta CSV para backup/migração
+async function handleExportMovimentacoes(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+
+    const rows = await db(env).prepare(
+      "SELECT * FROM movimentacoes_d1 ORDER BY id ASC"
+    ).all();
+    const results = rows?.results || [];
+
+    const header = "id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at";
+    const lines = results.map(r => [
+      r.id, csvEsc(r.DATA), csvEsc(r.CTO_ID), csvEsc(r.Tipo),
+      csvEsc(r.Cliente), csvEsc(r.Usuario), csvEsc(r.Observacao), csvEsc(r.created_at)
+    ].join(","));
+
+    const csv = [header, ...lines].join("
+");
+    return new Response(csv, {
+      headers: {
+        "Content-Type": "text/csv; charset=utf-8",
+        "Content-Disposition": `attachment; filename="movimentacoes_${new Date().toISOString().slice(0,10)}.csv"`,
+        "Access-Control-Allow-Origin": "*"
+      }
+    });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+function csvEsc(v) {
+  const s2 = String(v ?? "");
+  return s2.includes(",") || s2.includes('"') || s2.includes("
+")
+    ? '"' + s2.replace(/"/g, '""') + '"'
+    : s2;
+}
+
+// POST /api/movimentacoes/import — importa CSV legado em lote (admin)
+async function handleImportMovimentacoes(request, env) {
+  try {
+    await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    // Aceita { items: [{DATA, CTO_ID, Tipo, Cliente, Usuario, Observacao}, ...] }
+    const items = Array.isArray(body?.items) ? body.items : [];
+    if (!items.length) return json({ error: "items_empty" }, 400);
+    if (items.length > 50000) return json({ error: "too_many_items", max: 50000 }, 400);
+
+    let inserted = 0;
+    let skipped  = 0;
+    // Insere em lotes de 100 para não estourar limites do D1
+    for (let i = 0; i < items.length; i += 100) {
+      const batch = items.slice(i, i + 100);
+      const stmt = db(env).prepare(
+        "INSERT INTO movimentacoes_d1 (DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7)"
+      );
+      await db(env).batch(batch.map(r => {
+        const cto   = s(r.CTO_ID || r.cto_id || "");
+        const tipo  = s(r.Tipo   || r.tipo   || "");
+        const cli   = s(r.Cliente || r.cliente || "");
+        if (!cto || !tipo || !cli) { skipped++; return stmt.bind("","","","","","",""); }
+        inserted++;
+        return stmt.bind(
+          s(r.DATA || r.data || new Date().toISOString()),
+          cto, tipo, cli,
+          s(r.Usuario || r.usuario || ""),
+          s(r.Observacao || r.observacao || ""),
+          s(r.DATA || r.data || new Date().toISOString())
+        );
+      }).filter((_, idx) => {
+        const r = batch[idx];
+        return !!(s(r.CTO_ID||r.cto_id||"") && s(r.Tipo||r.tipo||"") && s(r.Cliente||r.cliente||""));
+      }));
+    }
+
+    return json({ ok: true, inserted, skipped, total: items.length });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
   }
 }
 
