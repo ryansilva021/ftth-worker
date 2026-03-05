@@ -69,11 +69,18 @@ export default {
       if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
       if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
 
+      // ===== Registro público (sem autenticação) =====
+      if (pathname === "/api/registro" && request.method === "POST")   return corsResponse(request, await handleRegistroPublico(request, env));
+      if (pathname === "/api/registro/check" && request.method === "GET") return corsResponse(request, await handleCheckDisponivel(request, env));
+
       // ===== Gerenciamento de projetos (superadmin) =====
       if (pathname === "/api/projetos" && request.method === "GET")    return corsResponse(request, await handleListProjetos(request, env));
       if (pathname === "/api/projetos" && request.method === "POST")   return corsResponse(request, await handleUpsertProjeto(request, env));
       if (pathname === "/api/projetos" && request.method === "DELETE") return corsResponse(request, await handleDeleteProjeto(request, env));
       if (pathname === "/api/projetos/stats" && request.method === "GET") return corsResponse(request, await handleProjetoStats(request, env));
+      if (pathname === "/api/registros" && request.method === "GET")           return corsResponse(request, await handleListRegistros(request, env));
+      if (pathname === "/api/registros/aprovar"  && request.method === "POST") return corsResponse(request, await handleAprovarRegistro(request, env));
+      if (pathname === "/api/registros/rejeitar" && request.method === "POST") return corsResponse(request, await handleRejeitarRegistro(request, env));
 
       // ===== Gerenciamento de usuários (admin) =====
       if (pathname === "/api/users" && request.method === "GET")    return corsResponse(request, await handleListUsers(request, env));
@@ -457,6 +464,26 @@ async function ensureSchema(env) {
     `).run();
   } catch (_e) {}
 
+  // Tabela registros_pendentes (cadastros aguardando aprovação)
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS registros_pendentes (
+        id                   INTEGER PRIMARY KEY AUTOINCREMENT,
+        projeto_id_proposto  TEXT NOT NULL,
+        empresa              TEXT NOT NULL,
+        admin_login          TEXT NOT NULL,
+        admin_senha_hash     TEXT NOT NULL,
+        email                TEXT,
+        telefone             TEXT,
+        plano                TEXT NOT NULL DEFAULT 'basico',
+        status               TEXT NOT NULL DEFAULT 'pendente',
+        criado_em            TEXT,
+        aprovado_em          TEXT,
+        aprovado_por         TEXT
+      )
+    `).run();
+  } catch (_e) {}
+
   // Garante projeto "default" para dados legados
   try {
     const def = await db(env).prepare("SELECT projeto_id FROM projetos WHERE projeto_id='default'").first();
@@ -504,6 +531,197 @@ async function hashPassword(password) {
   return `pbkdf2$${iter}$${saltB64}$${hashB64}`;
 }
 
+
+
+// ======================= Registro Público de Novos Assinantes =======================
+
+// Tabela registros_pendentes — criada em ensureSchema
+// GET /api/registro/check?empresa=xxx&login=yyy — verifica disponibilidade
+async function handleCheckDisponivel(request, env) {
+  try {
+    await ensureSchema(env);
+    const url    = new URL(request.url);
+    const empresa = s(url.searchParams.get("empresa") || "").trim();
+    const login   = s(url.searchParams.get("login")   || "").trim().toLowerCase();
+
+    const result = { empresa_ok: true, login_ok: true };
+
+    if (empresa) {
+      const pid = empresa.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20);
+      const ex  = await db(env).prepare(
+        "SELECT projeto_id FROM projetos WHERE projeto_id=?1 OR nome=?2"
+      ).bind(pid, empresa).first();
+      result.empresa_ok = !ex;
+    }
+
+    if (login) {
+      const ex = await db(env).prepare(
+        "SELECT username FROM users WHERE username=?1"
+      ).bind(login).first();
+      // também verifica pendentes
+      const exp = await db(env).prepare(
+        "SELECT id FROM registros_pendentes WHERE admin_login=?1 AND status='pendente'"
+      ).bind(login).first();
+      result.login_ok = !ex && !exp;
+    }
+
+    return json({ ok: true, ...result });
+  } catch (e) {
+    return json({ ok: true, empresa_ok: true, login_ok: true }); // fail open
+  }
+}
+
+// POST /api/registro — cadastro público de novo assinante
+// Body: { empresa, admin_login, admin_senha, email?, telefone?, plano? }
+// Se REGISTRO_AUTO_APROVAR=true no env → cria o projeto direto
+// Caso contrário → cria registro pendente aguardando superadmin aprovar
+async function handleRegistroPublico(request, env) {
+  try {
+    await ensureSchema(env);
+    const body = await readJson(request);
+
+    const empresa     = s(body?.empresa    || "").trim();
+    const admin_login = s(body?.admin_login|| "").trim().toLowerCase().replace(/[^a-z0-9_-]/g, "");
+    const admin_senha = s(body?.admin_senha|| "").trim();
+    const email       = s(body?.email      || "").trim();
+    const telefone    = s(body?.telefone   || "").trim();
+    const plano       = ["basico","pro"].includes(body?.plano) ? body.plano : "basico";
+
+    // Validações
+    if (!empresa)                    return json({ error: "empresa_obrigatoria" }, 400);
+    if (empresa.length < 2)          return json({ error: "empresa_muito_curta" }, 400);
+    if (!admin_login)                return json({ error: "login_obrigatorio" }, 400);
+    if (admin_login.length < 3)      return json({ error: "login_muito_curto", min: 3 }, 400);
+    if (!admin_senha)                return json({ error: "senha_obrigatoria" }, 400);
+    if (admin_senha.length < 6)      return json({ error: "senha_muito_curta", min: 6 }, 400);
+
+    // Verifica duplicatas
+    const projeto_id = empresa.toLowerCase().replace(/[^a-z0-9]/g, "").slice(0, 20)
+                       + "_" + Date.now().toString(36);
+
+    const exEmpresa = await db(env).prepare(
+      "SELECT projeto_id FROM projetos WHERE nome=?1"
+    ).bind(empresa).first();
+    if (exEmpresa) return json({ error: "empresa_ja_cadastrada" }, 409);
+
+    const exLogin = await db(env).prepare(
+      "SELECT username FROM users WHERE username=?1"
+    ).bind(admin_login).first();
+    if (exLogin) return json({ error: "login_ja_existe" }, 409);
+
+    const exPendente = await db(env).prepare(
+      "SELECT id FROM registros_pendentes WHERE admin_login=?1 AND status='pendente'"
+    ).bind(admin_login).first();
+    if (exPendente) return json({ error: "cadastro_ja_pendente" }, 409);
+
+    const now = new Date().toISOString();
+    const autoAprovar = env.REGISTRO_AUTO_APROVAR === "true" || env.REGISTRO_AUTO_APROVAR === "1";
+
+    if (autoAprovar) {
+      // Cria projeto e usuário admin imediatamente
+      const hash = await hashPassword(admin_senha);
+      await db(env).prepare(
+        "INSERT INTO projetos (projeto_id, nome, plano, ativo, criado_em) VALUES (?1,?2,?3,1,?4)"
+      ).bind(projeto_id, empresa, plano, now).run();
+      await db(env).prepare(
+        "INSERT INTO users (username, password_hash, role, is_active, projeto_id, created_at, updated_at) VALUES (?1,?2,'admin',1,?3,?4,?4)"
+      ).bind(admin_login, hash, projeto_id, now).run();
+
+      return json({ ok: true, status: "ativo", projeto_id, message: "Conta criada! Faça login no app." });
+    } else {
+      // Salva como pendente para aprovação manual
+      await db(env).prepare(`
+        INSERT INTO registros_pendentes
+          (projeto_id_proposto, empresa, admin_login, admin_senha_hash, email, telefone, plano, status, criado_em)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,'pendente',?8)
+      `).bind(projeto_id, empresa, admin_login, await hashPassword(admin_senha), email, telefone, plano, now).run();
+
+      return json({ ok: true, status: "pendente", message: "Cadastro recebido! Em breve você receberá o acesso." });
+    }
+  } catch (e) {
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+
+// GET /api/registros — lista pendentes (superadmin)
+async function handleListRegistros(request, env) {
+  try {
+    await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const url    = new URL(request.url);
+    const status = s(url.searchParams.get("status") || "pendente");
+    const rows   = await db(env).prepare(
+      "SELECT id,projeto_id_proposto,empresa,admin_login,email,telefone,plano,status,criado_em,aprovado_em,aprovado_por FROM registros_pendentes WHERE status=?1 ORDER BY criado_em DESC"
+    ).bind(status).all();
+    return json({ ok: true, items: rows?.results || [] });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/registros/aprovar — aprova cadastro pendente (superadmin)
+async function handleAprovarRegistro(request, env) {
+  try {
+    const auth = await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const id   = Number(body?.id);
+    if (!id) return json({ error: "id_required" }, 400);
+
+    const reg = await db(env).prepare(
+      "SELECT * FROM registros_pendentes WHERE id=?1 AND status='pendente'"
+    ).bind(id).first();
+    if (!reg) return json({ error: "registro_nao_encontrado" }, 404);
+
+    const now = new Date().toISOString();
+
+    // Cria projeto
+    await db(env).prepare(
+      "INSERT INTO projetos (projeto_id, nome, plano, ativo, criado_em) VALUES (?1,?2,?3,1,?4)"
+    ).bind(reg.projeto_id_proposto, reg.empresa, reg.plano, now).run();
+
+    // Cria usuário admin com a senha já hashada
+    await db(env).prepare(
+      "INSERT INTO users (username, password_hash, role, is_active, projeto_id, created_at, updated_at) VALUES (?1,?2,'admin',1,?3,?4,?4)"
+    ).bind(reg.admin_login, reg.admin_senha_hash, reg.projeto_id_proposto, now).run();
+
+    // Marca como aprovado
+    await db(env).prepare(
+      "UPDATE registros_pendentes SET status='aprovado', aprovado_em=?1, aprovado_por=?2 WHERE id=?3"
+    ).bind(now, auth.user, id).run();
+
+    return json({ ok: true, projeto_id: reg.projeto_id_proposto, empresa: reg.empresa, admin_login: reg.admin_login });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/registros/rejeitar — rejeita cadastro pendente (superadmin)
+async function handleRejeitarRegistro(request, env) {
+  try {
+    const auth = await requireSuperAdmin(request, env);
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const id   = Number(body?.id);
+    if (!id) return json({ error: "id_required" }, 400);
+
+    const now = new Date().toISOString();
+    await db(env).prepare(
+      "UPDATE registros_pendentes SET status='rejeitado', aprovado_em=?1, aprovado_por=?2 WHERE id=?3 AND status='pendente'"
+    ).bind(now, auth.user, id).run();
+
+    return json({ ok: true });
+  } catch (e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
 
 // ======================= Gerenciamento de Projetos (superadmin) =======================
 
