@@ -633,15 +633,26 @@ async function handleSaveDiagrama(request, env) {
 async function handleGetOlts(request, env) {
   try {
     const auth = await requireViewer(request, env);
-    await ensureSchema(env);
+    try { await ensureSchema(env); } catch(_) {}
     const pid = auth.projeto_id || "default";
-    const rows = await db(env).prepare(
-      "SELECT * FROM olts WHERE projeto_id=?1 ORDER BY nome"
-    ).bind(pid).all();
-    return json({ ok: true, items: rows?.results || [] });
+    let results = [];
+    try {
+      const rows = await db(env).prepare(
+        "SELECT * FROM olts WHERE projeto_id=?1 ORDER BY nome"
+      ).bind(pid).all();
+      results = rows?.results || [];
+    } catch(e2) {
+      // Tabela pode não ter projeto_id ainda — tenta sem filtro
+      try {
+        const rows2 = await db(env).prepare("SELECT * FROM olts ORDER BY nome LIMIT 200").all();
+        results = rows2?.results || [];
+      } catch(_) { results = []; }
+    }
+    return json({ ok: true, items: results });
   } catch(e) {
     if (e.code==="unauthorized") return json({error:"unauthorized"},401);
-    return json({error:String(e?.message||e)},500);
+    // Retorna lista vazia em vez de 500 para não travar o mapa
+    return json({ ok: true, items: [], _warn: String(e?.message||e) });
   }
 }
 
