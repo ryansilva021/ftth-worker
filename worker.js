@@ -73,6 +73,12 @@ export default {
       if (pathname === "/api/registro" && request.method === "POST")   return corsResponse(request, await handleRegistroPublico(request, env));
       if (pathname === "/api/registro/check" && request.method === "GET") return corsResponse(request, await handleCheckDisponivel(request, env));
 
+      // ===== OLTs e Topologia =====
+      if (pathname === "/api/olts" && request.method === "GET")    return corsResponse(request, await handleGetOlts(request, env));
+      if (pathname === "/api/olts" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudOlts(request, env));
+      if (pathname === "/api/topologia" && request.method === "GET") return corsResponse(request, await handleGetTopologia(request, env));
+      if (pathname === "/api/topologia/link" && request.method === "POST") return corsResponse(request, await handleLinkTopologia(request, env));
+
       // ===== Gerenciamento de projetos (superadmin) =====
       if (pathname === "/api/projetos" && request.method === "GET")    return corsResponse(request, await handleListProjetos(request, env));
       if (pathname === "/api/projetos" && request.method === "POST")   return corsResponse(request, await handleUpsertProjeto(request, env));
@@ -484,6 +490,42 @@ async function ensureSchema(env) {
     `).run();
   } catch (_e) {}
 
+  // Tabela OLTs (equipamento principal da rede)
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS olts (
+        id          TEXT PRIMARY KEY,
+        projeto_id  TEXT NOT NULL DEFAULT 'default',
+        nome        TEXT NOT NULL,
+        modelo      TEXT,
+        ip          TEXT,
+        capacidade  INTEGER DEFAULT 16,
+        obs         TEXT,
+        lat         REAL,
+        lng         REAL,
+        updated_at  TEXT
+      )
+    `).run();
+  } catch (_e) {}
+
+  // Colunas de topologia em caixas_emenda_cdo: olt_id, porta_olt, splitter
+  try {
+    const cxInfo = await db(env).prepare("PRAGMA table_info(caixas_emenda_cdo)").all();
+    const cxHave = new Set((cxInfo?.results||[]).map(r=>String(r.name||"").toLowerCase()));
+    for (const [c,t] of [["olt_id","TEXT"],["porta_olt","INTEGER"],["splitter_cdo","TEXT"]]) {
+      if (!cxHave.has(c)) try { await db(env).prepare(`ALTER TABLE caixas_emenda_cdo ADD COLUMN ${c} ${t}`).run(); } catch(_){}
+    }
+  } catch(_) {}
+
+  // Colunas de topologia em ctos: cdo_id, porta_cdo, splitter
+  try {
+    const ctInfo = await db(env).prepare("PRAGMA table_info(ctos)").all();
+    const ctHave = new Set((ctInfo?.results||[]).map(r=>String(r.name||"").toLowerCase()));
+    for (const [c,t] of [["cdo_id","TEXT"],["porta_cdo","INTEGER"],["splitter_cto","TEXT"]]) {
+      if (!ctHave.has(c)) try { await db(env).prepare(`ALTER TABLE ctos ADD COLUMN ${c} ${t}`).run(); } catch(_){}
+    }
+  } catch(_) {}
+
   // Garante projeto "default" para dados legados
   try {
     const def = await db(env).prepare("SELECT projeto_id FROM projetos WHERE projeto_id='default'").first();
@@ -532,6 +574,156 @@ async function hashPassword(password) {
 }
 
 
+
+
+// ======================= OLTs e Topologia =======================
+
+// GET /api/olts
+async function handleGetOlts(request, env) {
+  try {
+    const auth = await requireViewer(request, env);
+    await ensureSchema(env);
+    const pid = auth.projeto_id || "default";
+    const rows = await db(env).prepare(
+      "SELECT * FROM olts WHERE projeto_id=?1 ORDER BY nome"
+    ).bind(pid).all();
+    return json({ ok: true, items: rows?.results || [] });
+  } catch(e) {
+    if (e.code==="unauthorized") return json({error:"unauthorized"},401);
+    return json({error:String(e?.message||e)},500);
+  }
+}
+
+// POST /api/olts  body: {action:"upsert"|"delete", olt:{id,nome,modelo,ip,capacidade,obs,lat,lng}}
+async function handleCrudOlts(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const pid  = auth.projeto_id || "default";
+    const body = await readJson(request);
+    const action = s(body?.action || (request.method==="DELETE"?"delete":"upsert"));
+    const olt    = body?.olt || body;
+    const now    = new Date().toISOString();
+
+    if (action === "delete") {
+      const id = s(olt?.id || body?.id);
+      if (!id) return json({error:"id_required"},400);
+      // desvincula CE/CDOs que usavam essa OLT
+      await db(env).prepare("UPDATE caixas_emenda_cdo SET olt_id=NULL, porta_olt=NULL WHERE olt_id=?1 AND projeto_id=?2").bind(id, pid).run();
+      await db(env).prepare("DELETE FROM olts WHERE id=?1 AND projeto_id=?2").bind(id, pid).run();
+      return json({ok:true});
+    }
+
+    // upsert
+    const id   = s(olt?.id || olt?.ID || "").trim() || ("olt_"+Date.now().toString(36));
+    const nome = s(olt?.nome || "OLT");
+    const modelo   = s(olt?.modelo || "");
+    const ip       = s(olt?.ip || "");
+    const cap      = Number(olt?.capacidade) || 16;
+    const obs      = s(olt?.obs || "");
+    const lat      = olt?.lat != null ? Number(olt.lat) : null;
+    const lng      = olt?.lng != null ? Number(olt.lng) : null;
+
+    const exists = await db(env).prepare("SELECT id FROM olts WHERE id=?1 AND projeto_id=?2").bind(id, pid).first();
+    if (exists) {
+      await db(env).prepare(
+        "UPDATE olts SET nome=?2,modelo=?3,ip=?4,capacidade=?5,obs=?6,lat=?7,lng=?8,updated_at=?9 WHERE id=?1 AND projeto_id=?10"
+      ).bind(id,nome,modelo,ip,cap,obs,lat,lng,now,pid).run();
+    } else {
+      await db(env).prepare(
+        "INSERT INTO olts (id,projeto_id,nome,modelo,ip,capacidade,obs,lat,lng,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+      ).bind(id,pid,nome,modelo,ip,cap,obs,lat,lng,now).run();
+    }
+    return json({ok:true, id});
+  } catch(e) {
+    if (e.code==="forbidden")    return json({error:"forbidden"},403);
+    if (e.code==="unauthorized") return json({error:"unauthorized"},401);
+    return json({error:String(e?.message||e)},500);
+  }
+}
+
+// POST /api/topologia/link — vincula CE/CDO a OLT, ou CTO a CE/CDO
+// body: { type:"cdo_to_olt"|"cto_to_cdo", id, parent_id, porta, splitter }
+async function handleLinkTopologia(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+    await ensureSchema(env);
+    const pid  = auth.projeto_id || "default";
+    const body = await readJson(request);
+    const type = s(body?.type);
+    const id   = s(body?.id);
+    const parent_id = s(body?.parent_id);
+    const porta = body?.porta != null ? Number(body.porta) : null;
+    const splitter = s(body?.splitter || "");
+
+    if (type === "cdo_to_olt") {
+      await db(env).prepare(
+        "UPDATE caixas_emenda_cdo SET olt_id=?1, porta_olt=?2, splitter_cdo=?3 WHERE id=?4 AND projeto_id=?5"
+      ).bind(parent_id||null, porta, splitter||null, id, pid).run();
+      return json({ok:true});
+    }
+    if (type === "cto_to_cdo") {
+      await db(env).prepare(
+        "UPDATE ctos SET cdo_id=?1, porta_cdo=?2, splitter_cto=?3 WHERE cto_id=?4 AND projeto_id=?5"
+      ).bind(parent_id||null, porta, splitter||null, id, pid).run();
+      return json({ok:true});
+    }
+    return json({error:"type_invalid"},400);
+  } catch(e) {
+    if (e.code==="forbidden")    return json({error:"forbidden"},403);
+    if (e.code==="unauthorized") return json({error:"unauthorized"},401);
+    return json({error:String(e?.message||e)},500);
+  }
+}
+
+// GET /api/topologia — retorna árvore completa OLT→CE/CDO→CTOs
+async function handleGetTopologia(request, env) {
+  try {
+    const auth = await requireViewer(request, env);
+    await ensureSchema(env);
+    const pid = auth.projeto_id || "default";
+    const url = new URL(request.url);
+    const oltId = s(url.searchParams.get("olt_id")||"");
+    const cdoId = s(url.searchParams.get("cdo_id")||"");
+
+    const [oltsRes, cdosRes, ctosRes] = await Promise.all([
+      db(env).prepare("SELECT * FROM olts WHERE projeto_id=?1 ORDER BY nome").bind(pid).all(),
+      db(env).prepare("SELECT * FROM caixas_emenda_cdo WHERE projeto_id=?1 ORDER BY id").bind(pid).all(),
+      db(env).prepare("SELECT * FROM ctos WHERE projeto_id=?1 ORDER BY cto_id").bind(pid).all(),
+    ]);
+
+    const olts = oltsRes?.results || [];
+    const cdos = cdosRes?.results || [];
+    const ctos = ctosRes?.results || [];
+
+    // Monta árvore
+    const tree = olts.map(olt => {
+      const myCdos = cdos.filter(c => String(c.olt_id||"") === String(olt.id));
+      return {
+        ...olt,
+        cdos: myCdos.map(cdo => ({
+          ...cdo,
+          ctos: ctos.filter(ct => String(ct.cdo_id||"") === String(cdo.id))
+        }))
+      };
+    });
+
+    // CDOs sem OLT
+    const orphanCdos = cdos.filter(c => !c.olt_id).map(cdo => ({
+      ...cdo,
+      ctos: ctos.filter(ct => String(ct.cdo_id||"") === String(cdo.id))
+    }));
+
+    // CTOs sem CDO
+    const orphanCtos = ctos.filter(ct => !ct.cdo_id);
+
+    return json({ ok:true, tree, orphanCdos, orphanCtos,
+      stats: { olts: olts.length, cdos: cdos.length, ctos: ctos.length } });
+  } catch(e) {
+    if (e.code==="unauthorized") return json({error:"unauthorized"},401);
+    return json({error:String(e?.message||e)},500);
+  }
+}
 
 // ======================= Registro Público de Novos Assinantes =======================
 
