@@ -56,6 +56,7 @@ export default {
       // Auth
       if (pathname === "/api/login" && request.method === "POST") return corsResponse(request, await handleLogin(request, env));
       if (pathname === "/api/me" && request.method === "GET") return corsResponse(request, await handleMe(request, env));
+      if (pathname === "/api/health") return corsResponse(request, json({ ok: true, ts: new Date().toISOString() }));
       if (pathname === "/api/logout" && request.method === "POST") return corsResponse(request, await handleLogout(request, env));
 
       // Proxy helpers
