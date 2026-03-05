@@ -1430,21 +1430,24 @@ const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
     const cto = extractCto(body);
 
+    const pid_cto = auth.projeto_id || "default";
     if (!cto.CTO_ID) return json({ ok: false, error: "missing_cto_id" }, 400);
     if (action !== "DELETE" && (cto.LAT === null || cto.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
 
     if (action === "DELETE") {
-      const pid_cto = auth.projeto_id || "default";
       await db(env).prepare("DELETE FROM ctos WHERE cto_id=?1 AND projeto_id=?2").bind(cto.CTO_ID, pid_cto).run();
     } else {
+      const cdoId   = s(cto.cdo_id   || cto.CDO_ID   || body.cdo_id   || "");
+      const portaCdo= intOrNull(cto.porta_cdo ?? body.porta_cdo ?? null);
+      const splitCto= s(cto.splitter_cto || body.splitter_cto || "");
       const upd = await db(env).prepare(
-        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8 WHERE cto_id=?1 AND projeto_id=?9"
-      ).bind(cto.CTO_ID, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString(), pid_cto).run();
+        "UPDATE ctos SET nome=?2, rua=?3, bairro=?4, capacidade=?5, lat=?6, lng=?7, updated_at=?8, cdo_id=?10, porta_cdo=?11, splitter_cto=?12 WHERE cto_id=?1 AND projeto_id=?9"
+      ).bind(cto.CTO_ID, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString(), pid_cto, cdoId||null, portaCdo, splitCto||null).run();
 
       if (!upd || !upd.meta || upd.meta.changes === 0) {
         await db(env).prepare(
-          "INSERT INTO ctos (cto_id, projeto_id, nome, rua, bairro, capacidade, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
-        ).bind(cto.CTO_ID, pid_cto, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString()).run();
+          "INSERT INTO ctos (cto_id, projeto_id, nome, rua, bairro, capacidade, lat, lng, updated_at, cdo_id, porta_cdo, splitter_cto) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)"
+        ).bind(cto.CTO_ID, pid_cto, s(cto.NOME), s(cto.RUA), s(cto.BAIRRO), intOrNull(cto.CAPACIDADE), num(cto.LAT), num(cto.LNG), new Date().toISOString(), cdoId||null, portaCdo, splitCto||null).run();
       }
     }
 
@@ -1476,22 +1479,24 @@ const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
     const cx = extractCaixa(body);
 
+    const pid_cx = auth.projeto_id || "default";
     if (!cx.ID) return json({ ok: false, error: "missing_id" }, 400);
     if (action !== "DELETE" && (cx.LAT === null || cx.LNG === null)) return json({ ok: false, error: "missing_lat_lng" }, 400);
 
     if (action === "DELETE") {
-      const pid_cx = auth.projeto_id || "default";
       await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2").bind(cx.ID, pid_cx).run();
     } else {
-      // Update first (works even if no UNIQUE constraint; if none matched, insert)
+      const oltId   = s(cx.olt_id   || body.olt_id   || "");
+      const portaOlt= intOrNull(cx.porta_olt ?? body.porta_olt ?? null);
+      const splitCdo= s(cx.splitter_cdo || body.splitter_cdo || "");
       const upd = await db(env).prepare(
-        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7 WHERE id=?1 AND projeto_id=?8"
-      ).bind(cx.ID, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString(), pid_cx).run();
+        "UPDATE caixas_emenda_cdo SET tipo=?2, obs=?3, img_url=?4, lat=?5, lng=?6, updated_at=?7, olt_id=?9, porta_olt=?10, splitter_cdo=?11 WHERE id=?1 AND projeto_id=?8"
+      ).bind(cx.ID, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString(), pid_cx, oltId||null, portaOlt, splitCdo||null).run();
 
       if (!upd || !upd.meta || upd.meta.changes === 0) {
         await db(env).prepare(
-          "INSERT INTO caixas_emenda_cdo (id, projeto_id, tipo, obs, img_url, lat, lng, updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)"
-        ).bind(cx.ID, pid_cx, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString()).run();
+          "INSERT INTO caixas_emenda_cdo (id, projeto_id, tipo, obs, img_url, lat, lng, updated_at, olt_id, porta_olt, splitter_cdo) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
+        ).bind(cx.ID, pid_cx, s(cx.TIPO), s(cx.OBS), s(cx.IMG_URL), num(cx.LAT), num(cx.LNG), new Date().toISOString(), oltId||null, portaOlt, splitCdo||null).run();
       }
     }
 
@@ -1524,10 +1529,10 @@ const body = await readJson(request) || {};
     const nome = s(body.nome || body.NOME);
     let geojsonRaw = body.geojson ?? body.GEOJSON ?? body.data ?? body.feature ?? body.features;
 
+    const pid_r = auth.projeto_id || "default";
     if (!rota_id) return json({ ok: false, error: "missing_rota_id" }, 400);
 
     if (action === "DELETE") {
-      const pid_r = auth.projeto_id || "default";
       await db(env).prepare("DELETE FROM rotas WHERE rota_id=?1 AND projeto_id=?2").bind(rota_id, pid_r).run();
     } else {
       if (!geojsonRaw) return json({ ok: false, error: "missing_geojson", message: "O campo geojson é obrigatório para salvar uma rota." }, 400);
