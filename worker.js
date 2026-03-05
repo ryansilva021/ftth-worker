@@ -606,7 +606,7 @@ async function handleGetDiagrama(request, env) {
 
 async function handleSaveDiagrama(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     const pid  = auth.projeto_id || "default";
     await ensureSchema(env);
     const body = await readJson(request);
@@ -660,7 +660,7 @@ async function handleGetOlts(request, env) {
 // POST /api/olts  body: {action:"upsert"|"delete", olt:{id,nome,modelo,ip,capacidade,obs,lat,lng}}
 async function handleCrudOlts(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const pid  = auth.projeto_id || "default";
     const body = await readJson(request);
@@ -709,7 +709,7 @@ async function handleCrudOlts(request, env) {
 // body: { type:"cdo_to_olt"|"cto_to_cdo", id, parent_id, porta, splitter }
 async function handleLinkTopologia(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const pid  = auth.projeto_id || "default";
     const body = await readJson(request);
@@ -1259,7 +1259,7 @@ async function handleUpsertUser(request, env) {
 // DELETE /api/users — remove usuário { username }
 async function handleDeleteUser(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body = await readJson(request);
     const username = String(body?.username || "").trim().toLowerCase();
@@ -1282,7 +1282,7 @@ async function handleDeleteUser(request, env) {
 // POST /api/users/set-password — troca senha { username, password }
 async function handleSetPassword(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body = await readJson(request);
     const username = String(body?.username || "").trim().toLowerCase();
@@ -1308,7 +1308,7 @@ async function handleSetPassword(request, env) {
 // POST /api/users/toggle-active — ativa/desativa { username, is_active }
 async function handleToggleActive(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body     = await readJson(request);
     const username = String(body?.username || "").trim().toLowerCase();
@@ -1487,7 +1487,7 @@ function extractRota(body) {
 
 async function handleCrudCtos(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
         await ensureSchema(env);
 const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
@@ -1537,7 +1537,7 @@ const body = await readJson(request) || {};
 // POST /api/ctos/import — bulk upsert de CTOs (usado pelo import KMZ)
 async function handleImportCtos(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
     try { await ensureSchema(env); } catch(_) {}
     const pid   = auth.projeto_id || "default";
     const body  = await readJson(request) || {};
@@ -1579,7 +1579,7 @@ async function handleImportCtos(request, env) {
 
 async function handleCrudCaixas(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
         await ensureSchema(env);
 const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
@@ -1626,7 +1626,7 @@ const body = await readJson(request) || {};
 
 async function handleCrudRotas(request, env) {
   try {
-    const auth = await requireRole(request, env, ["admin"]);
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
         await ensureSchema(env);
 const body = await readJson(request) || {};
     const action = request.method === "DELETE" ? "DELETE" : "UPSERT";
@@ -1990,7 +1990,7 @@ async function handleGetMovimentacoes(request, env) {
 // GET /api/movimentacoes/export — exporta CSV para backup/migração
 async function handleExportMovimentacoes(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
 
     const rows = await db(env).prepare(
@@ -2028,7 +2028,7 @@ function csvEsc(v) {
 // POST /api/movimentacoes/import — importa CSV legado em lote (admin)
 async function handleImportMovimentacoes(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body = await readJson(request);
     // Aceita { items: [{DATA, CTO_ID, Tipo, Cliente, Usuario, Observacao}, ...] }
@@ -2076,7 +2076,7 @@ async function handleImportMovimentacoes(request, env) {
 // POST /api/movimentacoes — insere movimentação manual no D1
 async function handleAddMovimentacao(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body    = await readJson(request);
     const cto_id  = s(body?.CTO_ID  || body?.cto_id  || "");
@@ -2101,7 +2101,7 @@ async function handleAddMovimentacao(request, env) {
 // POST /api/movimentacoes/remove-cliente — desativa cliente (insere DESATIVACAO no D1)
 async function handleRemoveCliente(request, env) {
   try {
-    await requireRole(request, env, ["admin"]);
+    await requireRole(request, env, ["admin", "superadmin"]);
     await ensureSchema(env);
     const body    = await readJson(request);
     const cto_id  = s(body?.cto_id  || body?.CTO_ID  || "");
