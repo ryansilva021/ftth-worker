@@ -75,6 +75,8 @@ export default {
 
       // ===== OLTs e Topologia =====
       if (pathname === "/api/olts" && request.method === "GET")    return corsResponse(request, await handleGetOlts(request, env));
+      if (pathname === "/api/diagrama" && request.method === "GET")  return corsResponse(request, await handleGetDiagrama(request, env));
+      if (pathname === "/api/diagrama" && request.method === "POST") return corsResponse(request, await handleSaveDiagrama(request, env));
       if (pathname === "/api/olts" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudOlts(request, env));
       if (pathname === "/api/topologia" && request.method === "GET") return corsResponse(request, await handleGetTopologia(request, env));
       if (pathname === "/api/topologia/link" && request.method === "POST") return corsResponse(request, await handleLinkTopologia(request, env));
@@ -512,7 +514,7 @@ async function ensureSchema(env) {
   try {
     const cxInfo = await db(env).prepare("PRAGMA table_info(caixas_emenda_cdo)").all();
     const cxHave = new Set((cxInfo?.results||[]).map(r=>String(r.name||"").toLowerCase()));
-    for (const [c,t] of [["olt_id","TEXT"],["porta_olt","INTEGER"],["splitter_cdo","TEXT"]]) {
+    for (const [c,t] of [["olt_id","TEXT"],["porta_olt","INTEGER"],["splitter_cdo","TEXT"],["diagrama","TEXT"],["nome","TEXT"],["rua","TEXT"],["bairro","TEXT"]]) {
       if (!cxHave.has(c)) try { await db(env).prepare(`ALTER TABLE caixas_emenda_cdo ADD COLUMN ${c} ${t}`).run(); } catch(_){}
     }
   } catch(_) {}
@@ -575,6 +577,54 @@ async function hashPassword(password) {
 
 
 
+
+
+// ======================= Diagrama CE/CDO =======================
+
+async function handleGetDiagrama(request, env) {
+  try {
+    const auth = await requireViewer(request, env);
+    const pid  = auth.projeto_id || "default";
+    const url  = new URL(request.url);
+    const id   = s(url.searchParams.get("id") || "");
+    if (!id) return json({ error: "id_required" }, 400);
+    await ensureSchema(env);
+    const row = await db(env).prepare(
+      "SELECT id, tipo, nome, obs, diagrama FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2"
+    ).bind(id, pid).first();
+    if (!row) return json({ error: "not_found" }, 404);
+    let diagrama = null;
+    try { diagrama = row.diagrama ? JSON.parse(row.diagrama) : null; } catch(_) {}
+    return json({ ok: true, id: row.id, tipo: row.tipo, nome: row.nome, obs: row.obs, diagrama });
+  } catch(e) {
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
+
+async function handleSaveDiagrama(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+    const pid  = auth.projeto_id || "default";
+    await ensureSchema(env);
+    const body = await readJson(request);
+    const id   = s(body?.id || "");
+    if (!id) return json({ error: "id_required" }, 400);
+    const diagrama = JSON.stringify(body?.diagrama || {});
+    const exists = await db(env).prepare(
+      "SELECT id FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2"
+    ).bind(id, pid).first();
+    if (!exists) return json({ error: "not_found" }, 404);
+    await db(env).prepare(
+      "UPDATE caixas_emenda_cdo SET diagrama=?1, updated_at=?2 WHERE id=?3 AND projeto_id=?4"
+    ).bind(diagrama, new Date().toISOString(), id, pid).run();
+    return json({ ok: true });
+  } catch(e) {
+    if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
+    if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
+    return json({ error: String(e?.message || e) }, 500);
+  }
+}
 
 // ======================= OLTs e Topologia =======================
 
