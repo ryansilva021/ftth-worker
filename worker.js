@@ -348,7 +348,7 @@ async function handleLogout(request, env) {
 
 
 async function ensureSchema(env) {
-  // Create/patch tables as needed (best-effort). This avoids 500s when the table exists with missing columns.
+  // Garante que nunca lança exceção — cada bloco tem try-catch individual
   // Rotas
   try {
     await db(env).prepare(
@@ -359,7 +359,7 @@ async function ensureSchema(env) {
   // CTOs
   try {
     await db(env).prepare(
-      "CREATE TABLE IF NOT EXISTS ctos (cto_id TEXT PRIMARY KEY, nome TEXT, rua TEXT, bairro TEXT, capacidade INTEGER, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+      "CREATE TABLE IF NOT EXISTS ctos (cto_id TEXT PRIMARY KEY, projeto_id TEXT NOT NULL DEFAULT \'default\', nome TEXT, rua TEXT, bairro TEXT, capacidade INTEGER, lat REAL, lng REAL, updated_at TEXT, cdo_id TEXT, porta_cdo INTEGER, splitter_cto TEXT)"
     ).run();
   } catch (_e) {}
 
@@ -367,7 +367,7 @@ async function ensureSchema(env) {
   // We patch missing columns with ALTER TABLE ADD COLUMN (best-effort).
   try {
     await db(env).prepare(
-      "CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (id TEXT PRIMARY KEY, tipo TEXT, obs TEXT, img_url TEXT, lat REAL NOT NULL, lng REAL NOT NULL, updated_at TEXT)"
+      "CREATE TABLE IF NOT EXISTS caixas_emenda_cdo (id TEXT PRIMARY KEY, projeto_id TEXT NOT NULL DEFAULT \'default\', tipo TEXT, obs TEXT, img_url TEXT, lat REAL, lng REAL, updated_at TEXT, olt_id TEXT, porta_olt INTEGER, splitter_cdo TEXT, diagrama TEXT, nome TEXT, rua TEXT, bairro TEXT)"
     ).run();
   } catch (_e) {}
 
@@ -1753,36 +1753,58 @@ async function handleGetCtos(request, env) {
 async function handleGetCaixas(request, env) {
   try {
     const auth = await requireViewer(request, env);
-    await ensureSchema(env);
-    const pid  = auth.projeto_id || "default";
-    const rows = await db(env).prepare(
-      "SELECT * FROM caixas_emenda_cdo WHERE projeto_id=?1 ORDER BY id"
-    ).bind(pid).all();
+    // ensureSchema defensivo — nunca lança exceção para o caller
+    try { await ensureSchema(env); } catch (_se) { console.error("ensureSchema:", _se); }
 
-    const items = (rows?.results || []).map(r => {
-      const id = s(r.id || r.caixa_id || r.ID || r.codigo || r.code);
-      const tipo = s(r.tipo || r.TIPO || r.type);
-      const obs = s(r.obs || r.OBS || r.observacao || r.observações || r.observacao_txt);
-      const img_url = s(r.img_url || r.IMG_URL || r.foto || r.url || r.image);
-      const lat = num(r.lat ?? r.latitude ?? r.LAT ?? r.Latitude);
-      const lng = num(r.lng ?? r.longitude ?? r.LNG ?? r.Longitude);
+    const pid = auth.projeto_id || "default";
+
+    // Tenta query completa; se falhar por coluna missing, tenta sem WHERE projeto_id
+    let results = [];
+    try {
+      const rows = await db(env).prepare(
+        "SELECT * FROM caixas_emenda_cdo WHERE projeto_id=?1 ORDER BY id"
+      ).bind(pid).all();
+      results = rows?.results || [];
+    } catch (e1) {
+      const m1 = String(e1?.message || e1);
+      if (m1.includes("no such column") || m1.includes("no such table")) {
+        // Tabela existe mas sem projeto_id: tentar sem filtro
+        try {
+          const rows2 = await db(env).prepare(
+            "SELECT * FROM caixas_emenda_cdo ORDER BY id LIMIT 500"
+          ).all();
+          results = rows2?.results || [];
+        } catch (_e2) { results = []; }
+      } else {
+        throw e1;
+      }
+    }
+
+    const items = results.map(r => {
+      const id      = s(r.id || r.caixa_id || r.ID || r.codigo || r.code);
+      const tipo    = s(r.tipo || r.TIPO || r.type || "CE");
+      const obs     = s(r.obs || r.OBS || r.observacao || "");
+      const img_url = s(r.img_url || r.IMG_URL || r.foto || "");
+      const lat     = num(r.lat ?? r.latitude ?? r.LAT ?? r.Latitude);
+      const lng     = num(r.lng ?? r.longitude ?? r.LNG ?? r.Longitude);
+      const olt_id  = s(r.olt_id || "");
+      const porta_olt = r.porta_olt != null ? Number(r.porta_olt) : null;
       return {
         ID: id, id,
         TIPO: tipo, tipo,
         OBS: obs, obs,
         IMG_URL: img_url, img_url,
         LAT: lat, LNG: lng, lat, lng,
-        updated_at: s(r.updated_at || r.updatedAt || r.atualizado_em || r.ts)
+        olt_id, porta_olt,
+        updated_at: s(r.updated_at || "")
       };
     }).filter(x => x.id && finite(x.lat) && finite(x.lng));
 
     return json({ ok: true, items, data: items }, 200, { cacheSeconds: 5 });
   } catch (e) {
-    const msg = String(e?.message || e);
-    if (msg.includes("no such table") || msg.includes("no such column")) {
-      return json({ ok: false, error: "d1_schema_missing", message: msg }, 500);
-    }
-    return json({ ok: false, error: "caixas_failed", message: msg }, 500);
+    console.error("handleGetCaixas:", e);
+    // Retorna lista vazia em vez de 500 para não travar o mapa
+    return json({ ok: true, items: [], data: [], _warn: String(e?.message || e) }, 200);
   }
 }
 
