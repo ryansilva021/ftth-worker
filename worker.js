@@ -1534,6 +1534,49 @@ const body = await readJson(request) || {};
   }
 }
 
+// POST /api/ctos/import — bulk upsert de CTOs (usado pelo import KMZ)
+async function handleImportCtos(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin"]);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid   = auth.projeto_id || "default";
+    const body  = await readJson(request) || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ ok: false, error: "items_empty" }, 400);
+
+    let inserted = 0, updated = 0, skipped = 0;
+    const now = new Date().toISOString();
+
+    for (const row of items) {
+      try {
+        const ctoId  = s(row.CTO_ID || row.cto_id || "").trim();
+        const lat    = num(row.LAT  || row.lat);
+        const lng    = num(row.LNG  || row.lng);
+        const cap    = intOrNull(row.CAPACIDADE || row.capacidade || null);
+        const bairro = s(row.BAIRRO || row.bairro || "");
+        const rua    = s(row.RUA    || row.rua    || "");
+        const nome   = s(row.NOME   || row.nome   || ctoId);
+        if (!ctoId || !finite(lat) || !finite(lng)) { skipped++; continue; }
+        const upd = await db(env).prepare(
+          "UPDATE ctos SET nome=?2,rua=?3,bairro=?4,capacidade=?5,lat=?6,lng=?7,updated_at=?8 WHERE cto_id=?1 AND projeto_id=?9"
+        ).bind(ctoId, nome||ctoId, rua, bairro, cap, lat, lng, now, pid).run();
+        if (upd?.meta?.changes > 0) { updated++; }
+        else {
+          await db(env).prepare(
+            "INSERT INTO ctos (cto_id,projeto_id,nome,rua,bairro,capacidade,lat,lng,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)"
+          ).bind(ctoId, pid, nome||ctoId, rua, bairro, cap, lat, lng, now).run();
+          inserted++;
+        }
+      } catch(_) { skipped++; }
+    }
+    return json({ ok: true, inserted, updated, skipped });
+  } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok: false, error: "forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    return json({ ok: false, error: String(e?.message || e) }, 500);
+  }
+}
+
 async function handleCrudCaixas(request, env) {
   try {
     const auth = await requireRole(request, env, ["admin"]);
