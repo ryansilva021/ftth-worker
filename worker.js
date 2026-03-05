@@ -67,6 +67,7 @@ export default {
       // NOTE: Pages currently saves to /api/ctos and expects success.
       // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
       if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
+      if (pathname === "/api/ctos/import" && request.method === "POST") return corsResponse(request, await handleImportCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
       if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
 
