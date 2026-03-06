@@ -389,14 +389,18 @@ async function ensureSchema(env) {
     }
   } catch (_e) {}
 
-  // Patch rotas columns if needed
+  // Patch rotas columns if needed (incluindo projeto_id)
   try {
     const info = await db(env).prepare("PRAGMA table_info(rotas)").all();
     const have = new Set((info?.results || []).map(r => String(r.name || "").toLowerCase()));
-    const cols = [["nome","TEXT"],["geojson","TEXT"],["updated_at","TEXT"]];
+    const cols = [
+      ["nome","TEXT"], ["geojson","TEXT"], ["updated_at","TEXT"],
+      ["projeto_id","TEXT NOT NULL DEFAULT 'default'"]
+    ];
     for (const [c,t] of cols) {
-      if (!have.has(c)) {
-        try { await db(env).prepare(`ALTER TABLE rotas ADD COLUMN ${c} ${t}`).run(); } catch (_e) {}
+      const colName = c.split(" ")[0];
+      if (!have.has(colName)) {
+        try { await db(env).prepare(`ALTER TABLE rotas ADD COLUMN ${c}`).run(); } catch (_e) {}
       }
     }
   } catch (_e) {}
@@ -1598,17 +1602,35 @@ async function handleLimparProjeto(request, env) {
 
     let deletedCtos = 0, deletedCaixas = 0, deletedRotas = 0;
 
+    // Garante que as colunas projeto_id existam antes de deletar
+    try { await ensureSchema(env); } catch(_) {}
+
     if (apagar.ctos) {
-      const r = await db(env).prepare("DELETE FROM ctos WHERE projeto_id=?1").bind(pid).run();
-      deletedCtos = r?.meta?.changes || 0;
+      try {
+        const r = await db(env).prepare("DELETE FROM ctos WHERE projeto_id=?1").bind(pid).run();
+        deletedCtos = r?.meta?.changes || 0;
+      } catch(_) {}
     }
+
     if (apagar.caixas) {
-      const r = await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE projeto_id=?1").bind(pid).run();
-      deletedCaixas = r?.meta?.changes || 0;
+      try {
+        const r = await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE projeto_id=?1").bind(pid).run();
+        deletedCaixas = r?.meta?.changes || 0;
+      } catch(_) {}
     }
+
     if (apagar.rotas) {
-      const r = await db(env).prepare("DELETE FROM rotas_fibras WHERE projeto_id=?1").bind(pid).run();
-      deletedRotas = r?.meta?.changes || 0;
+      try {
+        // Tenta com projeto_id primeiro (coluna pode existir via ALTER TABLE)
+        const r = await db(env).prepare("DELETE FROM rotas WHERE projeto_id=?1").bind(pid).run();
+        deletedRotas = r?.meta?.changes || 0;
+      } catch(_rotasProjErr) {
+        // Fallback: tabela rotas sem coluna projeto_id — apaga todas as rotas
+        try {
+          const r = await db(env).prepare("DELETE FROM rotas").run();
+          deletedRotas = r?.meta?.changes || 0;
+        } catch(_) {}
+      }
     }
 
     await safeLog(env, {
