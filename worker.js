@@ -68,6 +68,7 @@ export default {
       // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
       if (pathname === "/api/postes" && request.method === "GET")           return corsResponse(request, await handleGetPostes(request, env));
       if (pathname === "/api/postes" && isWriteMethod(request.method))     return corsResponse(request, await handleCrudPostes(request, env));
+      if (pathname === "/api/postes/import" && request.method === "POST")  return corsResponse(request, await handleImportPostes(request, env));
       if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
       if (pathname === "/api/projeto/limpar" && request.method === "POST") return corsResponse(request, await handleLimparProjeto(request, env));
       if (pathname === "/api/ctos/import" && request.method === "POST") return corsResponse(request, await handleImportCtos(request, env));
@@ -1651,6 +1652,58 @@ async function handleCrudPostes(request, env) {
   }
 }
 
+// POST /api/postes/import — bulk upsert postes (admin)
+async function handleImportPostes(request, env) {
+  try {
+    const auth  = await requireRole(request, env, ["admin", "superadmin"]);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid   = auth.projeto_id || "default";
+    const body  = await readJson(request) || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ ok:false, error:"empty_items" }, 400);
+
+    const now = new Date().toISOString();
+    let inserted = 0, updated = 0, errors = 0;
+
+    for (const p of items) {
+      try {
+        const id   = s(p.poste_id || p.id || "");
+        const lat  = num(p.lat);
+        const lng  = num(p.lng);
+        if (!id || !finite(lat) || !finite(lng)) { errors++; continue; }
+
+        const tipo  = s(p.tipo  || "simples");
+        const nome  = s(p.nome  || id);
+        const altura= s(p.altura || "");
+        const mat   = s(p.material || "");
+        const prop  = s(p.proprietario || "");
+        const status= s(p.status || "ativo");
+        const rua   = s(p.rua   || "");
+        const bairro= s(p.bairro|| "");
+        const obs   = s(p.obs   || "");
+
+        const upd = await db(env).prepare(
+          "UPDATE postes SET tipo=?2,nome=?3,altura=?4,material=?5,proprietario=?6,status=?7,rua=?8,bairro=?9,obs=?10,lat=?11,lng=?12,updated_at=?13 WHERE poste_id=?1 AND projeto_id=?14"
+        ).bind(id,tipo,nome,altura,mat,prop,status,rua,bairro,obs,lat,lng,now,pid).run();
+
+        if (upd?.meta?.changes) { updated++; }
+        else {
+          await db(env).prepare(
+            "INSERT INTO postes (poste_id,projeto_id,tipo,nome,altura,material,proprietario,status,rua,bairro,obs,lat,lng,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+          ).bind(id,pid,tipo,nome,altura,mat,prop,status,rua,bairro,obs,lat,lng,now).run();
+          inserted++;
+        }
+      } catch(_) { errors++; }
+    }
+
+    return json({ ok:true, inserted, updated, errors });
+  } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok:false, error:"forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok:false, error:"unauthorized" }, 401);
+    return json({ ok:false, error:String(e?.message||e) }, 500);
+  }
+}
+
 // POST /api/ctos/import — bulk upsert de CTOs (usado pelo import KMZ)
 async function handleImportCtos(request, env) {
   try {
@@ -1710,6 +1763,7 @@ async function handleLimparProjeto(request, env) {
       ctos:   body.ctos   !== false,
       caixas: body.caixas !== false,
       rotas:  body.rotas  !== false,
+      postes: body.postes !== false,
     };
 
     let deletedCtos = 0, deletedCaixas = 0, deletedRotas = 0;
