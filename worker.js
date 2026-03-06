@@ -1805,7 +1805,16 @@ async function handleImportRotas(request, env) {
       try {
         const id   = s(r.rota_id || "");
         const nome = s(r.nome    || id);
-        const gj   = typeof r.geojson === "string" ? r.geojson : JSON.stringify(r.geojson);
+        let gj = r.geojson;
+        // Normaliza tipo dentro do GeoJSON antes de salvar
+        try {
+          const parsed = typeof gj === "string" ? JSON.parse(gj) : gj;
+          if (parsed?.properties) {
+            const tr = String(parsed.properties.tipo || "").toUpperCase().trim();
+            parsed.properties.tipo = ["BACKBONE","RAMAL","DROP"].includes(tr) ? tr : "RAMAL";
+          }
+          gj = JSON.stringify(parsed);
+        } catch(_) { gj = typeof r.geojson === "string" ? r.geojson : JSON.stringify(r.geojson); }
         if (!id || !gj) { errors++; continue; }
         const upd = await db(env).prepare(
           "UPDATE rotas SET nome=?2,geojson=?3,updated_at=?4 WHERE rota_id=?1 AND projeto_id=?5"
@@ -2229,7 +2238,10 @@ async function handleGetRotas(request, env) {
       const attachProps = (f) => {
         if (!f || f.type !== "Feature") return null;
         const p = (f.properties && typeof f.properties === "object") ? f.properties : {};
-        return { ...f, properties: { ...p, rota_id, nome } };
+        // Normaliza tipo para UPPERCASE — garante que filtros MapLibre funcionem
+        const tipoRaw = String(p.tipo || p.TIPO || p.type || "").toUpperCase().trim();
+        const tipoNorm = ["BACKBONE","RAMAL","DROP"].includes(tipoRaw) ? tipoRaw : (tipoRaw || "RAMAL");
+        return { ...f, properties: { ...p, rota_id, nome, tipo: tipoNorm } };
       };
 
       if (gj.type === "FeatureCollection" && Array.isArray(gj.features)) {
