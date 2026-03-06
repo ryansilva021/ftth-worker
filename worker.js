@@ -67,6 +67,7 @@ export default {
       // NOTE: Pages currently saves to /api/ctos and expects success.
       // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
       if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
+      if (pathname === "/api/projeto/limpar" && request.method === "POST") return corsResponse(request, await handleLimparProjeto(request, env));
       if (pathname === "/api/ctos/import" && request.method === "POST") return corsResponse(request, await handleImportCtos(request, env));
       if (pathname === "/api/caixas_emenda_cdo" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCaixas(request, env));
       if (pathname === "/api/rotas" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudRotas(request, env));
@@ -1571,6 +1572,53 @@ async function handleImportCtos(request, env) {
     }
     return json({ ok: true, inserted, updated, skipped });
   } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok: false, error: "forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
+    return json({ ok: false, error: String(e?.message || e) }, 500);
+  }
+}
+
+// POST /api/projeto/limpar — apaga CTOs, CE/CDOs e/ou Rotas do projeto (admin)
+// body: { ctos: bool, caixas: bool, rotas: bool, confirmacao: "LIMPAR" }
+async function handleLimparProjeto(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
+    const pid  = auth.projeto_id || "default";
+    const body = await readJson(request) || {};
+
+    if (body.confirmacao !== "LIMPAR") {
+      return json({ ok: false, error: "confirmacao_invalida" }, 400);
+    }
+
+    const apagar = {
+      ctos:   body.ctos   !== false,
+      caixas: body.caixas !== false,
+      rotas:  body.rotas  !== false,
+    };
+
+    let deletedCtos = 0, deletedCaixas = 0, deletedRotas = 0;
+
+    if (apagar.ctos) {
+      const r = await db(env).prepare("DELETE FROM ctos WHERE projeto_id=?1").bind(pid).run();
+      deletedCtos = r?.meta?.changes || 0;
+    }
+    if (apagar.caixas) {
+      const r = await db(env).prepare("DELETE FROM caixas_emenda_cdo WHERE projeto_id=?1").bind(pid).run();
+      deletedCaixas = r?.meta?.changes || 0;
+    }
+    if (apagar.rotas) {
+      const r = await db(env).prepare("DELETE FROM rotas_fibras WHERE projeto_id=?1").bind(pid).run();
+      deletedRotas = r?.meta?.changes || 0;
+    }
+
+    await safeLog(env, {
+      ts: new Date().toISOString(), user: auth.user, role: auth.role,
+      action: "LIMPAR_PROJETO", entity: "PROJETO", entity_id: pid,
+      details: JSON.stringify({ deletedCtos, deletedCaixas, deletedRotas, apagar })
+    });
+
+    return json({ ok: true, deletedCtos, deletedCaixas, deletedRotas });
+  } catch (e) {
     if (e?.code === "forbidden")    return json({ ok: false, error: "forbidden" }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
     return json({ ok: false, error: String(e?.message || e) }, 500);
