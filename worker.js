@@ -66,6 +66,8 @@ export default {
       // ===== CRUD (admin only) =====
       // NOTE: Pages currently saves to /api/ctos and expects success.
       // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
+      if (pathname === "/api/postes" && request.method === "GET")           return corsResponse(request, await handleGetPostes(request, env));
+      if (pathname === "/api/postes" && isWriteMethod(request.method))     return corsResponse(request, await handleCrudPostes(request, env));
       if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
       if (pathname === "/api/projeto/limpar" && request.method === "POST") return corsResponse(request, await handleLimparProjeto(request, env));
       if (pathname === "/api/ctos/import" && request.method === "POST") return corsResponse(request, await handleImportCtos(request, env));
@@ -352,6 +354,41 @@ async function handleLogout(request, env) {
 
 async function ensureSchema(env) {
   // Garante que nunca lança exceção — cada bloco tem try-catch individual
+  // Postes
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS postes (
+        poste_id    TEXT PRIMARY KEY,
+        projeto_id  TEXT NOT NULL DEFAULT 'default',
+        tipo        TEXT NOT NULL DEFAULT 'simples',
+        nome        TEXT,
+        altura      TEXT,
+        material    TEXT,
+        proprietario TEXT,
+        status      TEXT DEFAULT 'ativo',
+        rua         TEXT,
+        bairro      TEXT,
+        obs         TEXT,
+        lat         REAL,
+        lng         REAL,
+        updated_at  TEXT
+      )
+    `).run();
+  } catch (_e) {}
+  // Patch postes columns
+  try {
+    const info = await db(env).prepare("PRAGMA table_info(postes)").all();
+    const have = new Set((info?.results||[]).map(r=>String(r.name||"").toLowerCase()));
+    const cols = [["tipo","TEXT"],["nome","TEXT"],["altura","TEXT"],["material","TEXT"],
+      ["proprietario","TEXT"],["status","TEXT"],["rua","TEXT"],["bairro","TEXT"],
+      ["obs","TEXT"],["lat","REAL"],["lng","REAL"],["updated_at","TEXT"],["projeto_id","TEXT NOT NULL DEFAULT 'default'"]];
+    for (const [c,t] of cols) {
+      if (!have.has(c.split(" ")[0])) {
+        try { await db(env).prepare(`ALTER TABLE postes ADD COLUMN ${c} ${t}`).run(); } catch(_){} 
+      }
+    }
+  } catch(_) {}
+
   // Rotas
   try {
     await db(env).prepare(
@@ -1539,6 +1576,81 @@ const body = await readJson(request) || {};
   }
 }
 
+// GET /api/postes
+async function handleGetPostes(request, env) {
+  try {
+    const auth = await requireAuth(request, env);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid = auth.projeto_id || "default";
+    let rows = [];
+    try {
+      const r = await db(env).prepare("SELECT * FROM postes WHERE projeto_id=?1 ORDER BY updated_at DESC").bind(pid).all();
+      rows = r?.results || [];
+    } catch(_) {
+      try {
+        const r = await db(env).prepare("SELECT * FROM postes LIMIT 2000").all();
+        rows = r?.results || [];
+      } catch(_2) {}
+    }
+    return json({ ok: true, items: rows });
+  } catch(e) {
+    if (e?.code === "unauthorized") return json({ ok:false, error:"unauthorized" }, 401);
+    return json({ ok:true, items:[], _warn: String(e?.message||e) });
+  }
+}
+
+// POST/PUT/PATCH/DELETE /api/postes
+async function handleCrudPostes(request, env) {
+  try {
+    const auth = await requireRole(request, env, ["admin", "superadmin"]);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid  = auth.projeto_id || "default";
+    const body = await readJson(request) || {};
+    const now  = new Date().toISOString();
+
+    if (request.method === "DELETE") {
+      const id = s(body.poste_id || body.id || "");
+      if (!id) return json({ ok:false, error:"missing_poste_id" }, 400);
+      await db(env).prepare("DELETE FROM postes WHERE poste_id=?1 AND projeto_id=?2").bind(id, pid).run();
+      await safeLog(env, { ts:now, user:auth.user, role:auth.role, action:"DELETE_POSTE", entity:"POSTE", entity_id:id, details:"{}" });
+      return json({ ok:true });
+    }
+
+    const id     = s(body.poste_id || body.id || "");
+    const tipo   = s(body.tipo || "simples");
+    const nome   = s(body.nome || "");
+    const altura = s(body.altura || "");
+    const mat    = s(body.material || "");
+    const prop   = s(body.proprietario || "");
+    const status = s(body.status || "ativo");
+    const rua    = s(body.rua || "");
+    const bairro = s(body.bairro || "");
+    const obs    = s(body.obs || "");
+    const lat    = num(body.lat);
+    const lng    = num(body.lng);
+
+    if (!id)               return json({ ok:false, error:"missing_poste_id" }, 400);
+    if (!finite(lat) || !finite(lng)) return json({ ok:false, error:"missing_lat_lng" }, 400);
+
+    const upd = await db(env).prepare(
+      "UPDATE postes SET tipo=?2,nome=?3,altura=?4,material=?5,proprietario=?6,status=?7,rua=?8,bairro=?9,obs=?10,lat=?11,lng=?12,updated_at=?13 WHERE poste_id=?1 AND projeto_id=?14"
+    ).bind(id,tipo,nome,altura,mat,prop,status,rua,bairro,obs,lat,lng,now,pid).run();
+
+    if (!upd?.meta?.changes) {
+      await db(env).prepare(
+        "INSERT INTO postes (poste_id,projeto_id,tipo,nome,altura,material,proprietario,status,rua,bairro,obs,lat,lng,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)"
+      ).bind(id,pid,tipo,nome,altura,mat,prop,status,rua,bairro,obs,lat,lng,now).run();
+    }
+
+    await safeLog(env, { ts:now, user:auth.user, role:auth.role, action:"UPSERT_POSTE", entity:"POSTE", entity_id:id, details:JSON.stringify({tipo,lat,lng}) });
+    return json({ ok:true });
+  } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok:false, error:"forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok:false, error:"unauthorized" }, 401);
+    return json({ ok:false, error:String(e?.message||e) }, 500);
+  }
+}
+
 // POST /api/ctos/import — bulk upsert de CTOs (usado pelo import KMZ)
 async function handleImportCtos(request, env) {
   try {
@@ -1605,6 +1717,13 @@ async function handleLimparProjeto(request, env) {
     // Garante que as colunas projeto_id existam antes de deletar
     try { await ensureSchema(env); } catch(_) {}
 
+    let deletedPostes = 0;
+    if (apagar.postes) {
+      try {
+        const r = await db(env).prepare("DELETE FROM postes WHERE projeto_id=?1").bind(pid).run();
+        deletedPostes = r?.meta?.changes || 0;
+      } catch(_) {}
+    }
     if (apagar.ctos) {
       try {
         const r = await db(env).prepare("DELETE FROM ctos WHERE projeto_id=?1").bind(pid).run();
@@ -1639,7 +1758,7 @@ async function handleLimparProjeto(request, env) {
       details: JSON.stringify({ deletedCtos, deletedCaixas, deletedRotas, apagar })
     });
 
-    return json({ ok: true, deletedCtos, deletedCaixas, deletedRotas });
+    return json({ ok: true, deletedCtos, deletedCaixas, deletedRotas, deletedPostes });
   } catch (e) {
     if (e?.code === "forbidden")    return json({ ok: false, error: "forbidden" }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
