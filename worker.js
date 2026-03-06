@@ -68,7 +68,9 @@ export default {
       // We accept flexible body shapes and forward to Apps Script (APPS_SCRIPT_URL) using SUBMIT_KEY.
       if (pathname === "/api/postes" && request.method === "GET")           return corsResponse(request, await handleGetPostes(request, env));
       if (pathname === "/api/postes" && isWriteMethod(request.method))     return corsResponse(request, await handleCrudPostes(request, env));
-      if (pathname === "/api/postes/import" && request.method === "POST")  return corsResponse(request, await handleImportPostes(request, env));
+      if (pathname === "/api/postes/import"  && request.method === "POST") return corsResponse(request, await handleImportPostes(request, env));
+      if (pathname === "/api/caixas_emenda_cdo/import" && request.method === "POST") return corsResponse(request, await handleImportCaixas(request, env));
+      if (pathname === "/api/rotas/import"   && request.method === "POST") return corsResponse(request, await handleImportRotas(request, env));
       if (pathname === "/api/ctos" && isWriteMethod(request.method)) return corsResponse(request, await handleCrudCtos(request, env));
       if (pathname === "/api/projeto/limpar" && request.method === "POST") return corsResponse(request, await handleLimparProjeto(request, env));
       if (pathname === "/api/ctos/import" && request.method === "POST") return corsResponse(request, await handleImportCtos(request, env));
@@ -1746,6 +1748,85 @@ async function handleImportCtos(request, env) {
     return json({ ok: false, error: String(e?.message || e) }, 500);
   }
 }
+
+// POST /api/caixas_emenda_cdo/import — bulk upsert CE/CDOs
+async function handleImportCaixas(request, env) {
+  try {
+    const auth  = await requireRole(request, env, ["admin", "superadmin"]);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid   = auth.projeto_id || "default";
+    const body  = await readJson(request) || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ ok:false, error:"empty_items" }, 400);
+    const now = new Date().toISOString();
+    let inserted = 0, updated = 0, errors = 0;
+    for (const cx of items) {
+      try {
+        const id   = s(cx.id || "");
+        const lat  = num(cx.lat); const lng = num(cx.lng);
+        if (!id || !finite(lat) || !finite(lng)) { errors++; continue; }
+        const tipo = s(cx.tipo || "CE");
+        const nome = s(cx.nome || id);
+        const obs  = s(cx.obs  || "");
+        const rua  = s(cx.rua  || "");
+        const bairro = s(cx.bairro || "");
+        const upd = await db(env).prepare(
+          "UPDATE caixas_emenda_cdo SET tipo=?2,nome=?3,obs=?4,rua=?5,bairro=?6,lat=?7,lng=?8,updated_at=?9 WHERE id=?1 AND projeto_id=?10"
+        ).bind(id,tipo,nome,obs,rua,bairro,lat,lng,now,pid).run();
+        if (upd?.meta?.changes) { updated++; }
+        else {
+          await db(env).prepare(
+            "INSERT INTO caixas_emenda_cdo (id,projeto_id,tipo,nome,obs,rua,bairro,lat,lng,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)"
+          ).bind(id,pid,tipo,nome,obs,rua,bairro,lat,lng,now).run();
+          inserted++;
+        }
+      } catch(_) { errors++; }
+    }
+    return json({ ok:true, inserted, updated, errors });
+  } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok:false, error:"forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok:false, error:"unauthorized" }, 401);
+    return json({ ok:false, error:String(e?.message||e) }, 500);
+  }
+}
+
+// POST /api/rotas/import — bulk upsert Rotas
+async function handleImportRotas(request, env) {
+  try {
+    const auth  = await requireRole(request, env, ["admin", "superadmin"]);
+    try { await ensureSchema(env); } catch(_) {}
+    const pid   = auth.projeto_id || "default";
+    const body  = await readJson(request) || {};
+    const items = Array.isArray(body.items) ? body.items : [];
+    if (!items.length) return json({ ok:false, error:"empty_items" }, 400);
+    const now = new Date().toISOString();
+    let inserted = 0, updated = 0, errors = 0;
+    for (const r of items) {
+      try {
+        const id   = s(r.rota_id || "");
+        const nome = s(r.nome    || id);
+        const gj   = typeof r.geojson === "string" ? r.geojson : JSON.stringify(r.geojson);
+        if (!id || !gj) { errors++; continue; }
+        const upd = await db(env).prepare(
+          "UPDATE rotas SET nome=?2,geojson=?3,updated_at=?4 WHERE rota_id=?1 AND projeto_id=?5"
+        ).bind(id,nome,gj,now,pid).run();
+        if (upd?.meta?.changes) { updated++; }
+        else {
+          await db(env).prepare(
+            "INSERT INTO rotas (rota_id,projeto_id,nome,geojson,updated_at) VALUES (?1,?2,?3,?4,?5)"
+          ).bind(id,pid,nome,gj,now).run();
+          inserted++;
+        }
+      } catch(_) { errors++; }
+    }
+    return json({ ok:true, inserted, updated, errors });
+  } catch(e) {
+    if (e?.code === "forbidden")    return json({ ok:false, error:"forbidden" }, 403);
+    if (e?.code === "unauthorized") return json({ ok:false, error:"unauthorized" }, 401);
+    return json({ ok:false, error:String(e?.message||e) }, 500);
+  }
+}
+
 
 // POST /api/projeto/limpar — apaga CTOs, CE/CDOs e/ou Rotas do projeto (admin)
 // body: { ctos: bool, caixas: bool, rotas: bool, confirmacao: "LIMPAR" }
