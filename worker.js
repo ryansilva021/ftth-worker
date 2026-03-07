@@ -2441,20 +2441,20 @@ async function handleImportMovimentacoes(request, env) {
 // POST /api/movimentacoes — insere movimentação manual no D1
 async function handleAddMovimentacao(request, env) {
   try {
-    await requireRole(request, env, ["admin", "superadmin"]);
+    const auth    = await requireRole(request, env, ["admin", "superadmin", "tecnico"]);
     await ensureSchema(env);
     const body    = await readJson(request);
+    const pid     = auth.projeto_id || "default";
     const cto_id  = s(body?.CTO_ID  || body?.cto_id  || "");
-    const tipo    = s(body?.Tipo     || body?.tipo     || "");
+    const tipo    = s(body?.Tipo     || body?.tipo     || "INSTALACAO");
     const cliente = s(body?.Cliente  || body?.cliente  || "");
-    const usuario = s(body?.Usuario  || body?.usuario  || "");
+    const usuario = s(body?.Usuario  || body?.usuario  || auth.user || auth.username || "");
     const obs     = s(body?.Observacao || body?.observacao || "");
-    if (!cto_id || !tipo || !cliente) return json({ error: "missing_fields" }, 400);
-    const now     = new Date().toISOString();
-    const pid_add = auth.projeto_id || "default";
+    if (!cto_id || !cliente) return json({ error: "missing_fields: cto_id, cliente" }, 400);
+    const now = new Date().toISOString();
     await db(env).prepare(
       "INSERT INTO movimentacoes_d1 (projeto_id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?2)"
-    ).bind(pid_add, now, cto_id, tipo, cliente, usuario, obs).run();
+    ).bind(pid, now, cto_id, tipo || "INSTALACAO", cliente, usuario, obs).run();
     return json({ ok: true, action: "inserted" });
   } catch (e) {
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
@@ -2466,18 +2466,18 @@ async function handleAddMovimentacao(request, env) {
 // POST /api/movimentacoes/remove-cliente — desativa cliente (insere DESATIVACAO no D1)
 async function handleRemoveCliente(request, env) {
   try {
-    await requireRole(request, env, ["admin", "superadmin"]);
+    const auth    = await requireRole(request, env, ["admin", "superadmin", "tecnico"]);
     await ensureSchema(env);
     const body    = await readJson(request);
+    const pid     = auth.projeto_id || "default";
     const cto_id  = s(body?.cto_id  || body?.CTO_ID  || "");
     const cliente = s(body?.cliente  || body?.Cliente  || "");
-    const usuario = s(body?.usuario  || body?.Usuario  || "");
+    const usuario = s(body?.usuario  || body?.Usuario  || auth.user || auth.username || "");
     if (!cto_id || !cliente) return json({ error: "missing_fields: cto_id, cliente" }, 400);
-    const now     = new Date().toISOString();
-    const pid_rem = auth.projeto_id || "default";
+    const now = new Date().toISOString();
     await db(env).prepare(
       "INSERT INTO movimentacoes_d1 (projeto_id,DATA,CTO_ID,Tipo,Cliente,Usuario,Observacao,created_at) VALUES (?1,?2,?3,'DESATIVACAO',?4,?5,'Removido pelo admin',?2)"
-    ).bind(pid_rem, now, cto_id, cliente, usuario).run();
+    ).bind(pid, now, cto_id, cliente, usuario).run();
     return json({ ok: true, action: "removed", cto_id, cliente });
   } catch (e) {
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
