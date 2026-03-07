@@ -566,11 +566,11 @@ async function ensureSchema(env) {
     }
   } catch(_) {}
 
-  // Colunas de topologia em ctos: cdo_id, porta_cdo, splitter
+  // Colunas de topologia em ctos: cdo_id, porta_cdo, splitter, diagrama
   try {
     const ctInfo = await db(env).prepare("PRAGMA table_info(ctos)").all();
     const ctHave = new Set((ctInfo?.results||[]).map(r=>String(r.name||"").toLowerCase()));
-    for (const [c,t] of [["cdo_id","TEXT"],["porta_cdo","INTEGER"],["splitter_cto","TEXT"]]) {
+    for (const [c,t] of [["cdo_id","TEXT"],["porta_cdo","INTEGER"],["splitter_cto","TEXT"],["diagrama","TEXT"]]) {
       if (!ctHave.has(c)) try { await db(env).prepare(`ALTER TABLE ctos ADD COLUMN ${c} ${t}`).run(); } catch(_){}
     }
   } catch(_) {}
@@ -636,6 +636,20 @@ async function handleGetDiagrama(request, env) {
     const id   = s(url.searchParams.get("id") || "");
     if (!id) return json({ error: "id_required" }, 400);
     await ensureSchema(env);
+
+    // IDs prefixados com "CTO:" são diagramas de CTOs
+    if (id.startsWith("CTO:")) {
+      const ctoId = id.slice(4);
+      const row = await db(env).prepare(
+        "SELECT cto_id, nome, splitter_cto, diagrama FROM ctos WHERE cto_id=?1 AND projeto_id=?2"
+      ).bind(ctoId, pid).first();
+      if (!row) return json({ error: "not_found" }, 404);
+      let diagrama = null;
+      try { diagrama = row.diagrama ? JSON.parse(row.diagrama) : null; } catch(_) {}
+      return json({ ok: true, id, tipo: "CTO", nome: row.nome || ctoId, diagrama });
+    }
+
+    // Default: caixas_emenda_cdo
     const row = await db(env).prepare(
       "SELECT id, tipo, nome, obs, diagrama FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2"
     ).bind(id, pid).first();
@@ -658,6 +672,21 @@ async function handleSaveDiagrama(request, env) {
     const id   = s(body?.id || "");
     if (!id) return json({ error: "id_required" }, 400);
     const diagrama = JSON.stringify(body?.diagrama || {});
+
+    // IDs prefixados com "CTO:" salvam na tabela ctos
+    if (id.startsWith("CTO:")) {
+      const ctoId = id.slice(4);
+      const exists = await db(env).prepare(
+        "SELECT cto_id FROM ctos WHERE cto_id=?1 AND projeto_id=?2"
+      ).bind(ctoId, pid).first();
+      if (!exists) return json({ error: "not_found" }, 404);
+      await db(env).prepare(
+        "UPDATE ctos SET diagrama=?1, updated_at=?2 WHERE cto_id=?3 AND projeto_id=?4"
+      ).bind(diagrama, new Date().toISOString(), ctoId, pid).run();
+      return json({ ok: true });
+    }
+
+    // Default: caixas_emenda_cdo
     const exists = await db(env).prepare(
       "SELECT id FROM caixas_emenda_cdo WHERE id=?1 AND projeto_id=?2"
     ).bind(id, pid).first();
