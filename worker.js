@@ -680,9 +680,15 @@ async function handleSaveDiagrama(request, env) {
         "SELECT cto_id FROM ctos WHERE cto_id=?1 AND projeto_id=?2"
       ).bind(ctoId, pid).first();
       if (!exists) return json({ error: "not_found" }, 404);
+
+      // Sincroniza cdo_id e porta_cdo da entrada do diagrama → tabela ctos
+      const diagObj = body?.diagrama || {};
+      const entradaCeId   = s(diagObj?.entrada?.ce_id || "");
+      const entradaPorta  = diagObj?.entrada?.porta_cdo != null ? parseInt(diagObj.entrada.porta_cdo) || null : null;
+
       await db(env).prepare(
-        "UPDATE ctos SET diagrama=?1, updated_at=?2 WHERE cto_id=?3 AND projeto_id=?4"
-      ).bind(diagrama, new Date().toISOString(), ctoId, pid).run();
+        "UPDATE ctos SET diagrama=?1, updated_at=?2, cdo_id=?3, porta_cdo=?4 WHERE cto_id=?5 AND projeto_id=?6"
+      ).bind(diagrama, new Date().toISOString(), entradaCeId || null, entradaPorta, ctoId, pid).run();
       return json({ ok: true });
     }
 
