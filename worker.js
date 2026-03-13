@@ -336,6 +336,85 @@ async function requireSuperAdmin(request, env) {
   return await requireRole(request, env, ["superadmin"]);
 }
 
+// ══════════════════════════════════════════════════════════════════════════════
+//  Rate Limiting — proteção contra força bruta no /api/login
+//  • Por IP  : 5 falhas em 5 min → bloqueio de 15 min
+//  • Por user: 10 falhas em 10 min → bloqueio de 30 min
+// ══════════════════════════════════════════════════════════════════════════════
+const RL = {
+  IP:   { maxFails: 5,  windowMs: 5  * 60 * 1000, lockoutMs: 15 * 60 * 1000 },
+  USER: { maxFails: 10, windowMs: 10 * 60 * 1000, lockoutMs: 30 * 60 * 1000 },
+};
+
+function getClientIP(request) {
+  return (
+    request.headers.get("CF-Connecting-IP") ||
+    request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() ||
+    "unknown"
+  );
+}
+
+async function rlCheck(env, key, kind) {
+  // Retorna { blocked: true, retryAfter: segundos } ou { blocked: false }
+  const cfg    = kind === "ip" ? RL.IP : RL.USER;
+  const nowMs  = Date.now();
+  const window = new Date(nowMs - cfg.windowMs).toISOString();
+
+  // Conta tentativas na janela
+  let count = 0;
+  try {
+    const row = await db(env).prepare(
+      `SELECT COUNT(*) as n FROM login_attempts
+        WHERE key = ?1 AND kind = ?2 AND attempted_at > ?3`
+    ).bind(key, kind, window).first();
+    count = row?.n ?? 0;
+  } catch (_) {}
+
+  if (count >= cfg.maxFails) {
+    // Pega a mais recente para calcular tempo restante do lockout
+    let latestMs = nowMs;
+    try {
+      const row = await db(env).prepare(
+        `SELECT attempted_at FROM login_attempts
+          WHERE key = ?1 AND kind = ?2
+          ORDER BY attempted_at DESC LIMIT 1`
+      ).bind(key, kind).first();
+      if (row?.attempted_at) latestMs = Date.parse(row.attempted_at);
+    } catch (_) {}
+
+    const unlocksAt  = latestMs + cfg.lockoutMs;
+    const retryAfter = Math.max(0, Math.ceil((unlocksAt - nowMs) / 1000));
+    if (retryAfter > 0) return { blocked: true, retryAfter, count };
+  }
+  return { blocked: false, count };
+}
+
+async function rlRecord(env, key, kind, username = null) {
+  try {
+    await db(env).prepare(
+      `INSERT INTO login_attempts (key, kind, attempted_at, username)
+       VALUES (?1, ?2, ?3, ?4)`
+    ).bind(key, kind, new Date().toISOString(), username || null).run();
+  } catch (_) {}
+
+  // Housekeeping: apagar entradas > 2h para não inflar a tabela
+  try {
+    const cutoff = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
+    await db(env).prepare(
+      `DELETE FROM login_attempts WHERE attempted_at < ?1`
+    ).bind(cutoff).run();
+  } catch (_) {}
+}
+
+async function rlReset(env, key, kind) {
+  // Limpa tentativas após login bem-sucedido
+  try {
+    await db(env).prepare(
+      `DELETE FROM login_attempts WHERE key = ?1 AND kind = ?2`
+    ).bind(key, kind).run();
+  } catch (_) {}
+}
+
 async function handleLogin(request, env) {
   await ensureSchema(env);
   const body = await readJson(request);
@@ -343,13 +422,57 @@ async function handleLogin(request, env) {
   const password = String(body?.password ?? body?.pass ?? "");
   if (!username || !password) return json({ error: "missing_credentials" }, 400);
 
+  // ── Rate limiting por IP ──────────────────────────────────────────────────
+  const clientIP  = getClientIP(request);
+  const ipKey     = "ip:" + clientIP;
+  const userKey   = "user:" + username.toLowerCase();
+
+  const ipCheck = await rlCheck(env, ipKey, "ip");
+  if (ipCheck.blocked) {
+    const mins = Math.ceil(ipCheck.retryAfter / 60);
+    return json({
+      error:      "rate_limited",
+      kind:       "ip",
+      message:    `Muitas tentativas deste endereço. Tente novamente em ${mins} minuto${mins !== 1 ? "s" : ""}.`,
+      retry_after: ipCheck.retryAfter,
+    }, 429);
+  }
+
+  // ── Rate limiting por username ────────────────────────────────────────────
+  const userCheck = await rlCheck(env, userKey, "user");
+  if (userCheck.blocked) {
+    const mins = Math.ceil(userCheck.retryAfter / 60);
+    return json({
+      error:      "rate_limited",
+      kind:       "user",
+      message:    `Conta bloqueada temporariamente. Tente novamente em ${mins} minuto${mins !== 1 ? "s" : ""}.`,
+      retry_after: userCheck.retryAfter,
+    }, 429);
+  }
+
   const user = await db(env).prepare(
     "SELECT username, password_hash, is_active, role, projeto_id FROM users WHERE username=?1"
   ).bind(username).first();
 
-  if (!user || !user.is_active) return json({ error: "invalid_credentials" }, 401);
+  if (!user || !user.is_active) {
+    // Registra falha por IP (não por user — evita enumerar usuários existentes)
+    await rlRecord(env, ipKey, "ip", username);
+    return json({ error: "invalid_credentials" }, 401);
+  }
   const ok = await verifyPassword(password, user.password_hash);
-  if (!ok) return json({ error: "invalid_credentials" }, 401);
+  if (!ok) {
+    // Registra falha por IP e por username
+    await Promise.allSettled([
+      rlRecord(env, ipKey,   "ip",   username),
+      rlRecord(env, userKey, "user", username),
+    ]);
+    // Inclui quantas tentativas restam (sem revelar se user existe)
+    const remaining = Math.max(0, RL.IP.maxFails - (ipCheck.count + 1));
+    return json({
+      error:     "invalid_credentials",
+      remaining: remaining > 0 ? remaining : undefined,
+    }, 401);
+  }
 
   const role       = normalizeRole(user.role);
   const projeto_id = user.projeto_id || "default";
@@ -390,6 +513,12 @@ async function handleLogin(request, env) {
     const p = await db(env).prepare("SELECT nome FROM projetos WHERE projeto_id=?1").bind(projeto_id).first();
     if (p?.nome) projeto_nome = p.nome;
   } catch (_) {}
+
+  // ── Login bem-sucedido: limpar contadores de tentativas ─────────────────
+  await Promise.allSettled([
+    rlReset(env, ipKey,   "ip"),
+    rlReset(env, userKey, "user"),
+  ]);
 
   return json({ ok: true, token, user: { username, role, projeto_id, projeto_nome } });
 }
@@ -556,6 +685,22 @@ async function ensureSchema(env) {
       )
     `).run();
   } catch (_e) {}
+  // Tabela login_attempts — rate limiting de força bruta
+  try {
+    await db(env).prepare(`
+      CREATE TABLE IF NOT EXISTS login_attempts (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        key         TEXT NOT NULL,
+        kind        TEXT NOT NULL DEFAULT 'ip',
+        attempted_at TEXT NOT NULL,
+        username    TEXT
+      )
+    `).run();
+    await db(env).prepare(
+      `CREATE INDEX IF NOT EXISTS idx_login_attempts_key ON login_attempts (key, attempted_at)`
+    ).run();
+  } catch (_e) {}
+
   // Migrações de colunas — silenciosas se já existirem
   try {
     const sessionCols = [
