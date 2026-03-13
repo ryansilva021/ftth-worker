@@ -232,16 +232,32 @@ function base64Url(bytes) {
   let s = btoa(String.fromCharCode(...bytes));
   return s.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
 }
-async function mintSession(env, username, projeto_id) {
+async function mintSession(env, username, projeto_id, deviceInfo = {}) {
   const tokenBytes = crypto.getRandomValues(new Uint8Array(32));
   const token      = base64Url(tokenBytes);
   const tokenHash  = await sha256Hex(token);
   const ttl        = Number(env.SESSION_TTL_MS || (1000 * 60 * 60 * 24 * 7));
   const expiresAt  = new Date(Date.now() + ttl).toISOString();
   const pid        = projeto_id || "default";
+  const fp         = deviceInfo.fingerprint || null;
+  const label      = deviceInfo.label       || null;
+  const nowIso     = new Date().toISOString();
+
+  // ── Limpa sessões expiradas antes de inserir (housekeeping) ──────────────
+  try {
+    await db(env).prepare(
+      `DELETE FROM sessions WHERE username = ?1 AND expires_at < ?2`
+    ).bind(username, nowIso).run();
+  } catch (_) {}
+
+  // ── Insere nova sessão ────────────────────────────────────────────────────
   await db(env).prepare(
-    "INSERT INTO sessions (token_hash, username, projeto_id, created_at, expires_at) VALUES (?1, ?2, ?3, datetime('now'), ?4)"
-  ).bind(tokenHash, username, pid, expiresAt).run();
+    `INSERT INTO sessions
+       (token_hash, username, projeto_id, created_at, expires_at,
+        device_fingerprint, device_label, kicked_at)
+     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, NULL)`
+  ).bind(tokenHash, username, pid, nowIso, expiresAt, fp, label).run();
+
   return token;
 }
 async function requireAuth(request, env) {
@@ -250,15 +266,34 @@ async function requireAuth(request, env) {
 
   const tokenHash = await sha256Hex(token);
   const row = await db(env).prepare(
-    "SELECT username, projeto_id, expires_at FROM sessions WHERE token_hash=?1"
+    "SELECT username, projeto_id, expires_at, kicked_at, device_label FROM sessions WHERE token_hash=?1"
   ).bind(tokenHash).first();
 
   if (!row) throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
+
+  // ── Sessão expulsa por novo login em outro dispositivo ────────────────────
+  if (row.kicked_at) {
+    // Remove a sessão expulsa — não serve mais para nada
+    try { await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run(); } catch (_) {}
+    const err = Object.assign(new Error("session_displaced"), {
+      code: "session_displaced",
+      kicked_at: row.kicked_at,
+    });
+    throw err;
+  }
+
+  // ── Sessão expirada normalmente ────────────────────────────────────────────
   if (row.expires_at && Date.parse(row.expires_at) < Date.now()) {
-    await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run();
+    try { await db(env).prepare("DELETE FROM sessions WHERE token_hash=?1").bind(tokenHash).run(); } catch (_) {}
     throw Object.assign(new Error("unauthorized"), { code: "unauthorized" });
   }
-  return { user: row.username, tokenHash, projeto_id: row.projeto_id || "default" };
+
+  return {
+    user:       row.username,
+    tokenHash,
+    projeto_id: row.projeto_id || "default",
+    device_label: row.device_label || null,
+  };
 }
 function normalizeRole(role) {
   const r = String(role || "").trim().toLowerCase();
@@ -318,7 +353,36 @@ async function handleLogin(request, env) {
 
   const role       = normalizeRole(user.role);
   const projeto_id = user.projeto_id || "default";
-  const token      = await mintSession(env, username, projeto_id);
+
+  // Informação do dispositivo enviada pelo cliente (opcional)
+  const deviceInfo = {
+    fingerprint: String(body?.device_fingerprint ?? "").slice(0, 64) || null,
+    label:       String(body?.device_label       ?? "").slice(0, 120) || null,
+  };
+
+  // ── Bloquear login se já existe sessão ativa para este usuário ──────────
+  const nowCheck = new Date().toISOString();
+  let activeSession = null;
+  try {
+    activeSession = await db(env).prepare(
+      `SELECT device_label, created_at FROM sessions
+        WHERE username   = ?1
+          AND kicked_at  IS NULL
+          AND (expires_at IS NULL OR expires_at > ?2)
+        LIMIT 1`
+    ).bind(username, nowCheck).first();
+  } catch (_) {}
+
+  if (activeSession) {
+    const label = activeSession.device_label || "outro dispositivo";
+    return json({
+      error:   "already_logged_in",
+      message: `Usuário já está logado em: ${label}. Faça logout nesse dispositivo antes de entrar aqui.`,
+      device:  label,
+    }, 409);
+  }
+
+  const token = await mintSession(env, username, projeto_id, deviceInfo);
 
   // Busca nome do projeto
   let projeto_nome = projeto_id;
@@ -339,7 +403,8 @@ async function handleMe(request, env) {
       if (p?.nome) projeto_nome = p.nome;
     } catch (_) {}
     return json({ ok: true, user: { username: auth.user, role: full.role, projeto_id: auth.projeto_id, projeto_nome } });
-  } catch (_e) {
+  } catch (e) {
+    if (e?.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     return json({ error: "unauthorized" }, 401);
   }
 }
@@ -476,16 +541,36 @@ async function ensureSchema(env) {
     }
   } catch (_e) {}
 
-  // Tabela sessions — cria se não existir
+  // Tabela sessions — cria/migra
   try {
     await db(env).prepare(`
       CREATE TABLE IF NOT EXISTS sessions (
-        token_hash TEXT PRIMARY KEY,
-        username   TEXT NOT NULL,
-        created_at TEXT,
-        expires_at TEXT
+        token_hash         TEXT PRIMARY KEY,
+        username           TEXT NOT NULL,
+        projeto_id         TEXT NOT NULL DEFAULT 'default',
+        created_at         TEXT,
+        expires_at         TEXT,
+        device_fingerprint TEXT,
+        device_label       TEXT,
+        kicked_at          TEXT
       )
     `).run();
+  } catch (_e) {}
+  // Migrações de colunas — silenciosas se já existirem
+  try {
+    const sessionCols = [
+      ["projeto_id",         "TEXT NOT NULL DEFAULT 'default'"],
+      ["device_fingerprint", "TEXT"],
+      ["device_label",       "TEXT"],
+      ["kicked_at",          "TEXT"],
+    ];
+    for (const [c, t] of sessionCols) {
+      try { await db(env).prepare(`ALTER TABLE sessions ADD COLUMN ${c} ${t}`).run(); } catch (_) {}
+    }
+    // Índice para buscas por username (expulsar sessões antigas)
+    await db(env).prepare(
+      `CREATE INDEX IF NOT EXISTS idx_sessions_username ON sessions (username)`
+    ).run();
   } catch (_e) {}
 
   // Movimentacoes D1
@@ -658,6 +743,7 @@ async function handleGetDiagrama(request, env) {
     try { diagrama = row.diagrama ? JSON.parse(row.diagrama) : null; } catch(_) {}
     return json({ ok: true, id: row.id, tipo: row.tipo, nome: row.nome, obs: row.obs, diagrama });
   } catch(e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
   }
@@ -991,6 +1077,7 @@ async function handleListRegistros(request, env) {
     ).bind(status).all();
     return json({ ok: true, items: rows?.results || [] });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1030,6 +1117,7 @@ async function handleAprovarRegistro(request, env) {
 
     return json({ ok: true, projeto_id: reg.projeto_id_proposto, empresa: reg.empresa, admin_login: reg.admin_login });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1052,6 +1140,7 @@ async function handleRejeitarRegistro(request, env) {
 
     return json({ ok: true });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1096,6 +1185,7 @@ async function handleListProjetos(request, env) {
     }));
     return json({ ok: true, items });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1134,6 +1224,7 @@ async function handleProjetoStats(request, env) {
       }
     });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1199,6 +1290,7 @@ async function handleUpsertProjeto(request, env) {
 
     return json({ ok: true, projeto_id, nome, plano, ativo: ativo === 1, admin_created: adminCreated, action: existing ? "updated" : "created" });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1240,6 +1332,7 @@ async function handleDeleteProjeto(request, env) {
       return json({ ok: true, action: "deactivated", projeto_id });
     }
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1273,6 +1366,7 @@ async function handleListUsers(request, env) {
     }));
     return json({ ok: true, items });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1330,6 +1424,7 @@ async function handleUpsertUser(request, env) {
 
     return json({ ok: true, username, role: finalRole, projeto_id: finalProjeto, is_active: active === 1, action: existing ? "updated" : "created" });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1353,6 +1448,7 @@ async function handleDeleteUser(request, env) {
     await db(env).prepare("DELETE FROM sessions WHERE username=?1").bind(username).run();
     return json({ ok: true, username, action: "deleted" });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1379,6 +1475,7 @@ async function handleSetPassword(request, env) {
     await db(env).prepare("DELETE FROM sessions WHERE username=?1").bind(username).run();
     return json({ ok: true, username, action: "password_updated" });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1408,6 +1505,7 @@ async function handleToggleActive(request, env) {
     }
     return json({ ok: true, username, is_active: active === 1 });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -1607,6 +1705,7 @@ const body = await readJson(request) || {};
 
     return json({ ok: true });
   } catch (e) {
+    if (e?.code === "session_displaced") return json({ ok: false, error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
     return json({ ok: false, error: "cto_crud_failed", message: String(e?.stack || e), hint: "Verifique colunas da tabela ctos (cto_id/nome/rua/bairro/capacidade/lat/lng). Se sua tabela usa outros nomes, avise que eu ajusto." }, 500);
@@ -1986,6 +2085,7 @@ const body = await readJson(request) || {};
 
     return json({ ok: true });
   } catch (e) {
+    if (e?.code === "session_displaced") return json({ ok: false, error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
     return json({ ok: false, error: "caixa_crud_failed", message: String(e?.stack || e) }, 500);
@@ -2038,6 +2138,7 @@ const body = await readJson(request) || {};
 
     return json({ ok: true });
   } catch (e) {
+    if (e?.code === "session_displaced") return json({ ok: false, error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e?.code === "forbidden") return json({ ok: false, error: "forbidden", role: e.role }, 403);
     if (e?.code === "unauthorized") return json({ ok: false, error: "unauthorized" }, 401);
     return json({ ok: false, error: "rota_crud_failed", message: String(e?.stack || e) }, 500);
@@ -2384,6 +2485,7 @@ async function handleExportMovimentacoes(request, env) {
       }
     });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -2438,6 +2540,7 @@ async function handleImportMovimentacoes(request, env) {
 
     return json({ ok: true, inserted, skipped, total: items.length });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -2463,6 +2566,7 @@ async function handleAddMovimentacao(request, env) {
     ).bind(pid, now, cto_id, tipo || "INSTALACAO", cliente, usuario, obs).run();
     return json({ ok: true, action: "inserted" });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
@@ -2486,6 +2590,7 @@ async function handleRemoveCliente(request, env) {
     ).bind(pid, now, cto_id, cliente, usuario).run();
     return json({ ok: true, action: "removed", cto_id, cliente });
   } catch (e) {
+    if (e.code === "session_displaced") return json({ error: "session_displaced", message: "Sua conta foi acessada em outro dispositivo." }, 401);
     if (e.code === "forbidden")    return json({ error: "forbidden" }, 403);
     if (e.code === "unauthorized") return json({ error: "unauthorized" }, 401);
     return json({ error: String(e?.message || e) }, 500);
